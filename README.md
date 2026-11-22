@@ -1,8 +1,23 @@
 # tighten
 
-tighten runs strict linters on the lines you changed and reports what they find. It never edits code. It is meant for AI coding agents, which tend to pass checks by adding suppression comments, skipping tests or leaving strict-rule violations behind. tighten reports those problems at the end of an agent turn and at git pre-commit. The agent then has to fix the code.
+tighten runs strict linters on the lines you just changed and reports what they find. It never edits code.
 
-It replaces a chain of hk, Pkl, reviewdog, semgrep and a bash Stop hook with one Python script.
+It is built for AI coding agents. Agents often get a check to pass by working around it, with a new `# noqa` or `eslint-disable`, a test marked `.only` or `skip`, or a strict-rule violation left for later. tighten runs at the end of each agent turn and at git pre-commit. It enables the linter flags that ignore inline suppressions and reports new suppression comments and skipped tests. Findings cover changed lines only. Old issues elsewhere in the repo are not reported, and the agent has to fix the code it wrote.
+
+## Requirements
+
+- [uv](https://docs.astral.sh/uv/). tighten is a single-file uv script and uv fetches its Python dependencies on first run.
+- git.
+- The linters you want, on PATH. tighten installs none of them. A check whose tool is missing fails the run when it has files to check, so install the ones that match your languages.
+
+## Install
+
+```sh
+git clone https://github.com/sinnrrr/tighten
+ln -s "$PWD/tighten/tighten" ~/.local/bin/tighten
+```
+
+Keep the clone and symlink the script, because it loads its bundled configs from `embedded/` beside its real path.
 
 ## Usage
 
@@ -12,29 +27,7 @@ tighten staged   check staged changes only, for git pre-commit
 tighten stop     Claude Code Stop hook, reads the hook JSON on stdin
 ```
 
-tighten is a single-file [uv](https://docs.astral.sh/uv/) script. Put it on PATH with a symlink or a copy of the whole repo. It finds `embedded/` through its real path, and a symlink on PATH works. The linters come from PATH and tighten installs none of them.
-
-### Claude Code Stop hook
-
-Run `tighten stop` as a Stop hook with a 180 second timeout. A SessionStart hook has to write the session marker file `${TMPDIR:-/tmp}/claude-guards/<session_id>` first.
-
-In stop mode tighten exits 0 without output when `stop_hook_active` is true, when the marker file is missing or when the hook `cwd` is not inside a git work tree. It checks files that changed against HEAD and untracked files that are not ignored, but only those modified after the marker file. In those files every line changed against HEAD counts, including edits made before the session started.
-
-### Pre-commit
-
-Add this to a git config file. `git help hook` describes hooks defined in config. It was checked with git 2.56.1. The oldest git version with this feature was not checked.
-
-```gitconfig
-[hook "tighten"]
-	event = pre-commit
-	command = tighten staged
-```
-
-Staged mode checks the lines that the index adds against HEAD. Linters read files from the working tree, so a file whose working tree copy differs from its staged copy would be checked against the wrong content. tighten reports such a partially staged file as a failure with its path, skips linting it and exits 2. Stage the rest of the file or stash it, then commit again. Other files are still checked. Staged mode reads `GIT_INDEX_FILE`, so `git commit -a` and `git commit <path>` are checked against the index git is about to commit.
-
-## Output
-
-Findings go to stderr, grouped by file:
+Findings go to stderr, grouped by file, followed by a short instruction for the agent:
 
 ```
 src/app.ts
@@ -43,64 +36,85 @@ src/app.ts
 tighten: shellcheck-strict failed: shellcheck is not installed or not on PATH. Report this to the user and do not install it.
 ```
 
-Findings are followed by a closing instruction for the agent.
+| Exit code | Meaning |
+| --------- | ------- |
+| 0 | Nothing found, or stop mode had nothing to check |
+| 2 | At least one finding, or a tool was missing, failed, timed out or printed output tighten could not read |
+| 1 | Internal error or bad usage |
 
-## Exit codes
+## Claude Code
 
-| Code | Meaning |
-| ---- | ------- |
-| 0 | No findings and no tool failures, or stop mode had nothing to check |
-| 2 | At least one finding, or a tool was missing, failed, timed out or printed output that did not validate |
-| 1 | Internal error in tighten (Python prints the traceback), usage error, or bare `tighten` outside a git work tree |
+Add a SessionStart hook that writes a marker file and a Stop hook that runs tighten, in `~/.claude/settings.json` or a plugin's `hooks.json`:
+
+```json
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "jq -r '.session_id' | { read -r id; d=\"${TMPDIR:-/tmp}/claude-guards\"; mkdir -p \"$d\"; [ -e \"$d/$id\" ] || touch \"$d/$id\"; }"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [{ "type": "command", "command": "tighten stop", "timeout": 180 }]
+      }
+    ]
+  }
+}
+```
+
+In stop mode tighten checks only files modified after the session's marker file, so files the agent never touched are skipped. Within those files every line changed against HEAD counts, including uncommitted edits made before the session. It exits 0 with no output when `stop_hook_active` is set, when there is no marker or when the session is not in a git repo. On findings it exits 2 and Claude Code shows the report to the agent, which keeps working.
+
+## Git pre-commit
+
+With a git version that supports hooks in config (see `git help hook`, tested on 2.56):
+
+```gitconfig
+[hook "tighten"]
+	event = pre-commit
+	command = tighten staged
+```
+
+With older git, put `exec tighten staged` in `.git/hooks/pre-commit`.
+
+Linters read files from the working tree, so a file with unstaged edits on top of staged ones would be checked against the wrong content. tighten reports such a partially staged file and skips it. Stage or stash the rest and commit again.
 
 ## Checks
 
 | Check | Files | Runs in |
 | ----- | ----- | ------- |
-| actionlint | `.github/workflows/*.yml`, `*.yaml` | repo root |
-| zizmor | workflows plus `**/action.yml`, `**/action.yaml` | repo root |
-| typos | every file | repo root |
-| vale | `**/*.md`, `*.mdx`, `*.txt` | repo root |
-| rules | per rule, see `embedded/rules.toml` | in process |
+| suppression and skipped-test rules | per rule, see `embedded/rules.toml` | in process |
+| [actionlint](https://github.com/rhysd/actionlint) | `.github/workflows/*.yml`, `*.yaml` | repo root |
+| [zizmor](https://github.com/zizmorcore/zizmor) | workflows plus `**/action.yml`, `**/action.yaml` | repo root |
+| [typos](https://github.com/crate-ci/typos) | every file | repo root |
+| [vale](https://vale.sh) | `**/*.md`, `*.mdx`, `*.txt` | repo root |
 | eslint | JavaScript and TypeScript | nearest dir with `node_modules/.bin/eslint` |
-| tsc-strict | TypeScript, whole project | nearest dir with `tsconfig.json`, when `node_modules` exists there or in a parent inside the repo |
 | eslint-strict | TypeScript | nearest dir with `node_modules` |
-| ruff-strict | `**/*.py`, `*.pyi` | repo root |
-| ty-strict | `**/*.py`, `*.pyi` | nearest dir with `pyproject.toml` |
-| shellcheck-strict | `*.sh`, `*.bash`, and files whose shebang runs sh, dash or bash | repo root |
+| tsc-strict | TypeScript, whole project | nearest dir with `tsconfig.json`, when `node_modules` exists there or in a parent |
+| [ruff](https://docs.astral.sh/ruff/)-strict | `**/*.py`, `*.pyi` | repo root |
+| [ty](https://docs.astral.sh/ty/)-strict | `**/*.py`, `*.pyi` | nearest dir with `pyproject.toml` |
+| [shellcheck](https://www.shellcheck.net)-strict | `*.sh`, `*.bash` and files with an sh, dash or bash shebang | repo root |
 
-Flags, versions and globs are the ones from the old `hk.pkl`. Only the output format flags changed to structured ones. A check with no files in scope does not run. A workspace check with no workspace for a file skips that file without a message. A file that has no workspace for ty-strict (no `pyproject.toml`) is skipped too, same as in hk.
+- **Suppression rules** catch new lint and type suppressions across many tools (`eslint-disable`, `@ts-ignore`, `# noqa`, `# type: ignore`, `shellcheck disable`, `nosec` and more), focused or skipped JavaScript tests, unconditional pytest and unittest skips, and disabled JVM and .NET tests.
+- **Strict checks** add rules on top of the repo's own config and ignore inline suppressions. ruff runs with `--ignore-noqa` and extra rule sets, and tsc runs with every strict flag. The full flag lists are in the script.
+- **eslint** runs the repo's own eslint and config. tsc-strict and eslint-strict run pinned TypeScript and eslint through [deno](https://deno.com), so deno is needed for those two.
+- **vale** uses the bundled [ai-tells](https://github.com/tbhb/vale-ai-tells) style, which flags common AI writing patterns.
+- Checks with no files in scope are skipped, as are files outside any workspace for the workspace-based checks.
 
-Tool output is kept only when it points at a line that was added in a file in scope. Paths are resolved to repo-relative paths first, whether the tool printed a `file://` URI, a path relative to its working directory or an absolute path.
+## Design notes
 
-## Choices
+- **Hardcoded behavior.** Checks, flags and messages live in the script. Edit the script to change them.
+- **Changed lines come from [pygit2](https://www.pygit2.org).** It gives added line numbers directly, with no diff text to parse. `tests/parity` compares the result with `git diff` on renamed, staged, untracked and force-added files.
+- **Structured output.** SARIF or JSON where a tool has it, validated with [pydantic](https://docs.pydantic.dev). tsc has no structured output, so it gets a small strict regex parser. Output that does not validate counts as a tool failure.
+- **Failures are loud.** A missing tool, a crash, an unknown exit code or unreadable output fails the run with the tool name and a reason. A broken linter never looks like a pass.
+- **Timeouts clean up.** Each tool runs in its own process group with a 150 second timeout, under Claude Code's 180 second hook limit. On timeout tighten kills the group and every descendant it can find.
 
-- **pygit2 for diffs.** It returns added line numbers from libgit2 with no diff text to parse. libgit2 has no public call that equals `git diff HEAD`, and a plain tree-to-workdir diff misses force-added ignored files and reports renamed files as all new. tighten diffs HEAD against the index, merges in the index-to-workdir diff and runs rename detection, then takes untracked files from the workdir diff because the merge drops their content. `tests/parity` checks the result against `git diff HEAD -U0`, `git ls-files --others --exclude-standard` and `git diff --cached -U0` on a fixture with modified, staged, staged-then-edited, renamed, deleted, untracked and force-added ignored files.
-- **Unborn HEAD.** A repo with no commits is diffed against the empty tree, so its first commit is checked in full.
-- **Binary files** have no added lines and are never checked.
-- **pydantic models** validate SARIF, shellcheck json1, actionlint JSON, eslint JSON and vale JSON. Output that fails validation counts as a tool failure. Typed models avoid `Any`, which jmespath would return.
-- **SARIF where it works.** ruff, ty, typos and zizmor share one SARIF model. typos also has a JSON lines format, but SARIF lets it reuse the model.
-- **A small regex parser for tsc.** tsc has no structured output and no maintained Python parser was found. The file part is matched lazily up to the `(line,col): error TSnnnn:` tail, and paths with parentheses such as Next.js route groups parse. The parser is strict. A line that is not a diagnostic, a diagnostic with no file and a diagnostic on a non-source file such as `tsconfig.json` all count as tool failures.
-- **Exit codes per check.** Each check lists the codes that mean success and the codes that mean findings. Any other code is a failure with an excerpt of stderr. A findings code with no parsed findings is also a failure. A finding without a line number becomes a failure with its message.
-- **vale without `--no-exit`.** Its exit code now means something, and its config error JSON (a `Code` such as E201) is a failure.
-- **The semgrep rules run in process.** All four are `generic` regex rules. They live in `embedded/rules.toml` as TOML literal strings. The patterns are byte for byte the YAML ones. Python `re` compiles them unchanged. They run on each added line. Include and exclude globs use semgrep style matching through `PurePosixPath.match`, where `*.js` matches at any depth. The exclude for the rules file itself is now `embedded/rules.toml`. The tool name in a finding is the rule id.
-- **hk globs** are matched with `PurePosixPath.full_match` on repo-relative paths. `**/*.ts` and `**/action.yml` match files at the repo root too.
-- **Workspaces follow hk.** For each file tighten walks up to the repo root and takes the nearest directory where the indicator path exists. Each workspace gets one run with its directory as the working directory and file paths relative to it.
-- **tsc-strict node_modules condition, generalized.** hk evaluates `test -d node_modules` in its own working directory, which is the repo root. That would skip a package with its own `node_modules` when the root has none. tighten runs tsc-strict when `node_modules` exists in the workspace directory or any parent up to the repo root, which covers both the hoisted root layout and per-package installs.
-- **Shebang detection** uses `identify.parse_shebang` and `tags_from_interpreter` from [identify](https://github.com/pre-commit/identify). `parse_shebang_from_file` and `tags_from_path` only read shebangs of executable files, while hk also reads them for files with no extension. tighten reads the shebang when the file has no extension or is executable, as hk does. identify tags `dash` without `sh`, so dash is accepted explicitly. identify does not understand `#!/bin/env bash`, which hk does. `#!/usr/bin/env bash` and `#!/usr/bin/env -S bash` work.
-- **`-x` for shellcheck** is passed on the command line instead of `SHELLCHECK_OPTS`.
-- **Threads and process groups.** One thread per check and workspace. Each tool starts in its own process group with stdin closed. On timeout tighten snapshots the tool's descendants with psutil, kills the process group and then each process in the snapshot, so children that left the group with `setsid` die too. A descendant whose parent already exited is reparented to launchd and tighten cannot find it. That is the limit of this approach. The timeout is 150 seconds per run, leaving headroom under the 180 second hook limit.
-- **Missing tools** count only when their check has files in scope. The message tells the agent to report it and not to install anything.
-- **`--no-warn-ignored` for repo eslint.** This is the one flag added to an hk command. Without it eslint 10 prints a warning with no line number for each passed file that the repo config ignores, and tighten would count that as a failure on every change to an ignored file. hk with reviewdog dropped those warnings. eslint-strict already had the flag.
-- **Tool failures fail the run.** hk ignored them. A repo with `node_modules/.bin/eslint` but no eslint config now fails the eslint check with exit 2 from eslint.
-- **Embedded configs** (`zizmor.yml`, `eslint.config.mjs`, `vale/.vale.ini`) are passed by absolute path. The eslint config and zizmor config are copied unchanged.
-- **Argument handling is two lines of code.** There is one optional positional with two values. argparse would also exit 2 on usage errors, and tighten uses 2 for findings.
-- **`_typos.toml`** excludes the vendored vale style, whose regex fragments are word pieces that typos reads as misspellings, and allows `xdescribe`, a test function name in the rules.
-- **The PEP 723 block is the only comment** in the script, because uv needs it.
-
-## Verified tool behavior
-
-These come from real runs on this machine with the versions below.
+## Tested with
 
 | Tool | Version | Clean | Findings | Failure |
 | ---- | ------- | ----- | -------- | ------- |
@@ -114,18 +128,16 @@ These come from real runs on this machine with the versions below.
 | ty | 0.0.107 | 0 | 1 | 2 bad flag or config or missing path, 101 internal error |
 | shellcheck | 0.11.0 | 0 | 1 | 2 unreadable file, 3 bad syntax, 4 bad option |
 
-tsc reports config errors with the same exit code as type errors, so tighten tells them apart by how the lines look. A config error has no file location or points at a non-source file.
-
-## Tests
+## Development
 
 ```
-tests/parity      pygit2 against git CLI diffs, prints PASS or FAIL
-tests/self-lint   ruff and ty strict on the scripts, plus a violation copy that both must flag
+tests/parity      changed-line detection against git CLI diffs
+tests/self-lint   ruff and ty strict on the scripts, plus a planted violation both must catch
 ```
 
 ## Credits
 
-`embedded/vale/styles/ai-tells` is [tbhb/vale-ai-tells](https://github.com/tbhb/vale-ai-tells) v1.37.0, the release that `Packages = ai-tells` resolved to, by Tony Burns under the MIT license. Its license is in that directory.
+`embedded/vale/styles/ai-tells` is [tbhb/vale-ai-tells](https://github.com/tbhb/vale-ai-tells) v1.37.0 by Tony Burns, MIT licensed. Its license is in that directory.
 
 ## License
 
