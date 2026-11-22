@@ -1,0 +1,83 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.15,<3.16"
+# dependencies = ["identify>=2.6.20", "psutil>=7.2.2", "pydantic>=2.14.4", "pygit2>=1.21.0", "unidiff>=0.7.5"]
+# ///
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+from runpy import run_path
+
+import pygit2
+from unidiff import PatchSet
+
+TIGHTEN = Path(__file__).resolve().parent.parent / "tighten"
+SETUP = """
+set -e
+printf 'ignored.py\\n' > .gitignore
+for f in mod smod sedit ren del; do for i in 1 2 3 4 5 6 7 8; do echo "${f}_v$i = $i"; done > $f.py; done
+git add -A
+git commit -qm init
+sed -i.bak 's/^mod_v3 = 3/mod_v3 = 33/' mod.py
+sed -i.bak 's/^smod_v2 = 2/smod_v2 = 22/' smod.py
+git add smod.py
+sed -i.bak 's/^smod_v7 = 7/smod_v7 = 77/' smod.py
+printf 'n1 = 1\\nn2 = 2\\n' > snew.py
+git add snew.py
+printf 'e1 = 1\\ne2 = 2\\n' > snewedit.py
+git add snewedit.py
+printf 'e3 = 3\\n' >> snewedit.py
+git mv ren.py ren2.py
+sed -i.bak 's/^ren_v5 = 5/ren_v5 = 55/' ren2.py
+git rm -q del.py
+printf 'u1 = 1\\nu2 = 2\\n' > untracked.py
+printf 'i1 = 1\\n' > ignored.py
+git add -f ignored.py
+printf 'i2 = 2\\n' >> ignored.py
+sed -i.bak 's/^sedit_v1 = 1/sedit_v1 = 11/' sedit.py
+git add sedit.py
+sed -i.bak 's/^sedit_v8 = 8/sedit_v8 = 88/' sedit.py
+rm -f ./*.bak
+"""
+
+
+def git(root: Path, *args: str) -> str:
+    return subprocess.run(["git", *args], cwd=root, check=True, capture_output=True, text=True).stdout
+
+
+def expected(root: Path, *, staged: bool) -> dict[str, set[int]]:
+    found: dict[str, set[int]] = {}
+    for patched in PatchSet(git(root, "diff", "--cached" if staged else "HEAD", "-U0", "--no-color")):
+        lines = {line.target_line_no for hunk in patched for line in hunk if line.is_added and line.target_line_no}
+        if lines and not patched.is_removed_file:
+            found[patched.path] = lines
+    if not staged:
+        for path in git(root, "ls-files", "--others", "--exclude-standard").splitlines():
+            found[path] = set(range(1, len((root / path).read_text().splitlines()) + 1))
+    return found
+
+
+def main() -> int:
+    changes = run_path(str(TIGHTEN), run_name="tighten")["changes"]
+    failed = False
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp).resolve()
+        git(root, "init", "-q")
+        subprocess.run(["bash", "-c", SETUP], cwd=root, check=True)
+        print(git(root, "status", "--short"))
+        repo = pygit2.Repository(str(root))
+        for staged in (False, True):
+            got = changes(repo, staged=staged)
+            want = expected(root, staged=staged)
+            label = "staged" if staged else "worktree"
+            print(f"{label} tighten: {sorted((k, sorted(v)) for k, v in got.items())}")
+            print(f"{label} git:     {sorted((k, sorted(v)) for k, v in want.items())}")
+            ok = got == want
+            failed = failed or not ok
+            print(f"{label}: {'PASS' if ok else 'FAIL'}")
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

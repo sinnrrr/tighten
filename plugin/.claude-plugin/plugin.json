@@ -1,0 +1,8 @@
+{
+  "name": "tighten",
+  "version": "1.0.0",
+  "description": "Runs strict linters on the lines changed this session before a turn ends",
+  "author": {
+    "name": "sinnrrr"
+  }
+}

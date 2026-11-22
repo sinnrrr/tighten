@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+set -euo pipefail
+here=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
+cd "$here"
+ruff_flags=(check --no-fix --ignore-noqa --force-exclude --output-format concise --extend-select "ANN,B,BLE,ASYNC,PGH,RUF" --extend-ignore "B008,RUF005,RUF010,RUF021,RUF022,RUF023")
+ty_flags=(check --output-format concise --color never --force-exclude -c analysis.respect-type-ignore-comments=false --ignore import-not-found --error missing-type-argument --error possibly-unresolved-reference --error possibly-missing-attribute --error possibly-missing-import --error unused-awaitable --error deprecated --error redundant-cast)
+status=0
+for script in tighten tests/parity tests/verify-design; do
+  uv sync --quiet --script "$script"
+  python=$(uv python find --script "$script")
+  printf '\n$ ruff %s %s\n' "${ruff_flags[*]}" "$script"
+  ruff "${ruff_flags[@]}" "$script" || status=1
+  printf '\n$ ty %s --python %s %s\n' "${ty_flags[*]}" "$python" "$script"
+  ty "${ty_flags[@]}" --python "$python" "$script" || status=1
+done
+printf '\n$ shellcheck -x -S info tests/verify-tools tests/self-lint\n'
+shellcheck -x -S info -o check-set-e-suppressed,check-extra-masked-returns,check-unassigned-uppercase tests/verify-tools tests/self-lint || status=1
+copy=$(mktemp -d)
+trap 'rm -rf "$copy"' EXIT
+cp tighten "$copy/tighten"
+printf '\n\ndef bad(x):\n    return x\n\n\nz: int = "s"\n' >> "$copy/tighten"
+python=$(uv python find --script tighten)
+printf '\nviolation copy, both must report:\n'
+if ruff "${ruff_flags[@]}" "$copy/tighten"; then echo "FAIL ruff missed the violation"; status=1; else echo "PASS ruff reported it"; fi
+if ty "${ty_flags[@]}" --python "$python" "$copy/tighten"; then echo "FAIL ty missed the violation"; status=1; else echo "PASS ty reported it"; fi
+exit "$status"

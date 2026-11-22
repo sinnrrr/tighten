@@ -1,0 +1,85 @@
+#!/usr/bin/env bash
+set -euo pipefail
+here=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
+embedded="$here/embedded"
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+cd "$work"
+mkdir -p .github/workflows other
+
+printf 'teh\n' > typo.md
+printf '# Notes\n\nThis is a testament to robust synergy.\n' > prose.md
+printf '# Notes\n\nThe app reads a file and prints the count of lines in it.\n' > clean.md
+printf 'x: int = "s"  # type: ignore\n' > bad.py
+printf 'x = 1\n' > good.py
+printf 'import os  # noqa\n' > noqa.py
+cat > bad.sh <<'EOF'
+#!/bin/bash
+echo $1
+EOF
+cat > .github/workflows/ci.yml <<'EOF'
+on: push
+jobs:
+  a:
+    runs-on: foo-bar
+    steps:
+      - uses: actions/checkout@v4
+      - run: echo ${{ github.event.issue.title }}
+EOF
+cat > .github/workflows/label.yml <<'EOF'
+on: push
+permissions: {}
+jobs:
+  a:
+    runs-on: foo-bar
+    steps:
+      - run: echo hi
+EOF
+printf 'StylesPath = missing\nMinAlertLevel = error\n[*.md]\nBasedOnStyles = ai-tells\n' > other/broken.ini
+
+show() {
+  printf '\n$ %s\n' "$*"
+  set +e
+  "$@" > "$work/out.txt" 2> "$work/err.txt"
+  code=$?
+  set -e
+  if jq -e '.runs' "$work/out.txt" > /dev/null 2>&1; then
+    jq -c '.runs[].results[] | {ruleId, message, location: .locations[0].physicalLocation | {uri: .artifactLocation.uri, line: .region.startLine}}' "$work/out.txt"
+  else
+    head -c 1200 "$work/out.txt"
+  fi
+  head -c 300 "$work/err.txt"
+  printf '\n[exit %s]\n' "$code"
+}
+
+ignore='label ".+" is unknown'
+show ty check --output-format sarif bad.py
+show ty check --output-format sarif -c analysis.respect-type-ignore-comments=false bad.py
+show ty check --output-format sarif good.py
+show ty check --bogus
+show typos --format sarif typo.md
+show typos --format sarif clean.md
+show typos --format sarif missing.md
+show zizmor --offline --format sarif --config "$embedded/zizmor.yml" .github/workflows/ci.yml
+show zizmor --offline --config "$embedded/zizmor.yml" .github/workflows/ci.yml
+show zizmor --offline --format sarif missing.yml
+show zizmor --bogus
+show ruff check --output-format sarif noqa.py
+show ruff check --output-format sarif --ignore-noqa noqa.py
+show ruff check --output-format sarif good.py
+show ruff check --bogus
+show shellcheck -f json1 bad.sh
+show shellcheck -f json1 missing.sh
+show shellcheck --bogus
+show shellcheck -f bogus bad.sh
+show actionlint -ignore "$ignore" -format '{{json .}}' .github/workflows/ci.yml
+show actionlint -ignore "$ignore" -format '{{json .}}' .github/workflows/label.yml
+show actionlint -format '{{json .}}' .github/workflows/label.yml
+show actionlint -format '{{json .}}' missing.yml
+show actionlint -bogus
+show vale --config "$embedded/vale/.vale.ini" --output=JSON prose.md
+show vale --config "$embedded/vale/.vale.ini" --output=JSON clean.md
+show vale --config other/broken.ini --output=JSON prose.md
+show vale --config /missing.ini --output=JSON prose.md
+cd /
+show env VALE_CONFIG_PATH=/missing.ini vale --config "$embedded/vale/.vale.ini" --output=JSON "$work/prose.md"

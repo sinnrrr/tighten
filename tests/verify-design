@@ -1,0 +1,98 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.15,<3.16"
+# dependencies = ["identify>=2.6.20", "psutil>=7.2.2", "pydantic>=2.14.4", "pygit2>=1.21.0"]
+# ///
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import tomllib
+from pathlib import Path, PurePosixPath
+from runpy import run_path
+
+import pygit2
+
+HERE = Path(__file__).resolve().parent.parent
+SEMGREP = Path.home() / ".dotfiles/general/ai/.agents/semgrep/rules.yml"
+results: list[tuple[str, bool]] = []
+
+
+def check(name: str, *, ok: bool) -> None:
+    results.append((name, ok))
+    print(f"{'PASS' if ok else 'FAIL'} {name}")
+
+
+def globs() -> None:
+    cases = [
+        ("a.ts", "**/*.ts", True), ("x/y/a.ts", "**/*.ts", True), ("action.yml", "**/action.yml", True),
+        ("a/action.yml", "**/action.yml", True), (".github/workflows/a.yml", ".github/workflows/*.yml", True),
+        ("x/.github/workflows/a.yml", ".github/workflows/*.yml", False), ("README", "**/*", True),
+    ]
+    for path, glob, want in cases:
+        check(f"full_match({path!r}, {glob!r}) is {want}", ok=PurePosixPath(path).full_match(glob) == want)
+    for path, glob, want in [("x/y/a.js", "*.js", True), ("x/embedded/rules.toml", "embedded/rules.toml", True)]:
+        check(f"match({path!r}, {glob!r}) is {want}", ok=PurePosixPath(path).match(glob) == want)
+
+
+def rules() -> None:
+    data = tomllib.loads((HERE / "embedded/rules.toml").read_text())["rules"]
+    for rule in data:
+        re.compile(rule["pattern"])
+        check(f"{rule['id']} compiles in re", ok=True)
+    if not SEMGREP.exists():
+        print(f"NOTE {SEMGREP} is gone, verbatim comparison not possible")
+        return
+    source = SEMGREP.read_text()
+    for rule in data:
+        check(f"{rule['id']} pattern and message are verbatim", ok=rule["pattern"] in source and rule["message"] in source)
+
+
+def shebangs(tighten: dict[str, object]) -> None:
+    has_shell_shebang = tighten["has_shell_shebang"]
+    if not callable(has_shell_shebang):
+        check("has_shell_shebang is callable", ok=False)
+        return
+    with tempfile.TemporaryDirectory() as tmp:
+        cases = [
+            ("env-bash", "#!/usr/bin/env bash\n", 0o644, True), ("sh", "#!/bin/sh\n", 0o644, True),
+            ("env-s", "#!/usr/bin/env -S bash -eu\n", 0o644, True), ("dash", "#!/bin/dash\n", 0o755, True),
+            ("python", "#!/usr/bin/env python3\n", 0o755, False), ("zsh", "#!/bin/zsh\n", 0o644, False),
+            ("plain", "echo hi\n", 0o644, False), ("x.txt", "#!/bin/bash\n", 0o644, False),
+            ("x.cgi", "#!/bin/bash\n", 0o755, True),
+        ]
+        for name, body, mode, want in cases:
+            path = Path(tmp) / name
+            path.write_text(body)
+            path.chmod(mode)
+            check(f"shebang {name} mode {oct(mode)} is shell: {want}", ok=has_shell_shebang(path) == want)
+
+
+def index_from_env() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+        (root / "a.txt").write_text("a\n")
+        alt = root / "alt-index"
+        subprocess.run(["git", "add", "a.txt"], cwd=root, check=True, env={**os.environ, "GIT_INDEX_FILE": str(alt)})
+        plain = pygit2.Repository(str(root))
+        check("plain open ignores GIT_INDEX_FILE", ok=len(plain.index) == 0)
+        code = "import sys, pygit2; print(len(pygit2.Repository(sys.argv[1], pygit2.enums.RepositoryOpenFlag.FROM_ENV).index))"
+        child = subprocess.run(
+            [sys.executable, "-c", code, str(root)], env={**os.environ, "GIT_INDEX_FILE": str(alt)},
+            check=True, capture_output=True, text=True,
+        )
+        check("FROM_ENV open reads GIT_INDEX_FILE from the process environment", ok=child.stdout.strip() == "1")
+
+
+def main() -> int:
+    globs()
+    rules()
+    shebangs(run_path(str(HERE / "tighten"), run_name="tighten"))
+    index_from_env()
+    return 0 if all(ok for _, ok in results) else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

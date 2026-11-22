@@ -1,0 +1,607 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.15,<3.16"
+# dependencies = ["identify>=2.6.20", "psutil>=7.2.2", "pydantic>=2.14.4", "pygit2>=1.21.0"]
+# ///
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import tomllib
+from collections.abc import Callable, Iterable
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import suppress
+from dataclasses import dataclass, field
+from pathlib import Path, PurePosixPath
+
+import psutil
+import pygit2
+from identify.identify import parse_shebang, tags_from_interpreter
+from pydantic import BaseModel, ConfigDict, TypeAdapter, ValidationError
+from pydantic.alias_generators import to_camel, to_pascal
+from pygit2.enums import DeltaStatus, DiffOption, FileStatus, RepositoryOpenFlag
+
+TIMEOUT = 150
+EMBEDDED = Path(__file__).resolve().parent / "embedded"
+HOME = Path.home()
+TSC_CACHE = f"{HOME}/.cache/agent-tsc"
+TYPESCRIPT_VERSION = "5.9.3"
+ESLINT_VERSION = "10.15.0"
+DENO = ("deno", "run", "--quiet", "--no-config", "--no-lock", "--node-modules-dir=none", "--no-prompt", "--allow-read", "--allow-env")
+WORKFLOWS = (".github/workflows/*.yml", ".github/workflows/*.yaml")
+TYPESCRIPT = ("**/*.ts", "**/*.tsx", "**/*.mts", "**/*.cts")
+JAVASCRIPT = ("**/*.js", "**/*.jsx", "**/*.mjs", "**/*.cjs")
+PYTHON = ("**/*.py", "**/*.pyi")
+SHELL = ("**/*.sh", "**/*.bash")
+SHEBANG_SHELLS = frozenset({"sh", "dash", "bash"})
+TSC_FLAGS = (
+    "--strict", "--noImplicitAny", "--strictNullChecks", "--strictFunctionTypes", "--strictBindCallApply",
+    "--strictPropertyInitialization", "--useUnknownInCatchVariables", "--noImplicitThis",
+    "--noUncheckedIndexedAccess", "--noImplicitOverride", "--noImplicitReturns", "--noFallthroughCasesInSwitch",
+)
+UNTRACKED = DiffOption.INCLUDE_UNTRACKED | DiffOption.RECURSE_UNTRACKED_DIRS | DiffOption.SHOW_UNTRACKED_CONTENT
+INDEX_FLAGS = FileStatus.INDEX_NEW | FileStatus.INDEX_MODIFIED | FileStatus.INDEX_RENAMED | FileStatus.INDEX_TYPECHANGE
+WORKTREE_FLAGS = FileStatus.WT_MODIFIED | FileStatus.WT_DELETED | FileStatus.WT_RENAMED | FileStatus.WT_TYPECHANGE
+STOP_TRAILER = (
+    "tighten found problems in lines you changed this session. Fix them without suppression comments. "
+    "If a rule does not fit this repo, change it in the repo lint config and say why. "
+    "If something is outside your task, list it in your reply and ask."
+)
+STAGED_TRAILER = (
+    "tighten: fix the code above without adding suppression comments. "
+    "If a rule does not fit this repo, change it in the repo lint config and say why. "
+    "If two rules contradict each other, stop and report both rule names to the user."
+)
+USAGE = "usage: tighten [stop|staged]"
+
+type Added = dict[str, set[int]]
+type Raw = tuple[str, int | None, str]
+
+
+class ToolFailureError(Exception):
+    pass
+
+
+class Model(BaseModel):
+    model_config = ConfigDict(alias_generator=to_camel, frozen=True)
+
+
+class SarifMessage(Model):
+    text: str | None = None
+    markdown: str | None = None
+
+
+class SarifRegion(Model):
+    start_line: int | None = None
+
+
+class SarifArtifact(Model):
+    uri: str
+
+
+class SarifPhysical(Model):
+    artifact_location: SarifArtifact
+    region: SarifRegion | None = None
+
+
+class SarifLocation(Model):
+    physical_location: SarifPhysical | None = None
+
+
+class SarifResult(Model):
+    rule_id: str | None = None
+    message: SarifMessage
+    locations: list[SarifLocation] = []
+
+
+class SarifRun(Model):
+    results: list[SarifResult]
+
+
+class Sarif(Model):
+    runs: list[SarifRun]
+
+
+class ShellcheckComment(Model):
+    file: str
+    line: int
+    code: int
+    message: str
+
+
+class Shellcheck(Model):
+    comments: list[ShellcheckComment]
+
+
+class ActionlintError(Model):
+    message: str
+    filepath: str
+    line: int
+    kind: str
+
+
+class EslintMessage(Model):
+    rule_id: str | None = None
+    message: str
+    line: int | None = None
+
+
+class EslintFile(Model):
+    file_path: str
+    messages: list[EslintMessage]
+
+
+class ValeModel(BaseModel):
+    model_config = ConfigDict(alias_generator=to_pascal, frozen=True)
+
+
+class ValeAlert(ValeModel):
+    check: str
+    message: str
+    line: int
+
+
+class ValeError(ValeModel):
+    code: str
+    text: str
+
+
+class Rule(BaseModel):
+    model_config = ConfigDict(frozen=True)
+    id: str
+    message: str
+    pattern: str
+    include: list[str] = []
+    exclude: list[str] = []
+
+
+class Rules(BaseModel):
+    rules: list[Rule]
+
+
+class StopInput(BaseModel):
+    session_id: str
+    cwd: str
+    stop_hook_active: bool = False
+
+
+SARIF = TypeAdapter(Sarif)
+SHELLCHECK = TypeAdapter(Shellcheck)
+ACTIONLINT = TypeAdapter(list[ActionlintError])
+ESLINT = TypeAdapter(list[EslintFile])
+VALE = TypeAdapter(ValeError | dict[str, list[ValeAlert]])
+TSC_LINE = re.compile(r"(?P<file>.+?)\((?P<line>\d+),\d+\): (?:error|warning) (?P<code>TS\d+): (?P<msg>.*)")
+TSC_GLOBAL = re.compile(r"(?:error|warning) TS\d+: .*")
+
+
+def parse_sarif(out: str) -> list[Raw]:
+    raws: list[Raw] = []
+    for result in (r for run in SARIF.validate_json(out).runs for r in run.results):
+        text = result.message.text or result.message.markdown or ""
+        message = f"{result.rule_id} {text}" if result.rule_id else text
+        physical = [loc.physical_location for loc in result.locations if loc.physical_location]
+        if not physical:
+            raws.append(("", None, message))
+        for loc in physical:
+            raws.append((loc.artifact_location.uri, loc.region.start_line if loc.region else None, message))
+    return raws
+
+
+def parse_shellcheck(out: str) -> list[Raw]:
+    return [(c.file, c.line, f"SC{c.code} {c.message}") for c in SHELLCHECK.validate_json(out).comments]
+
+
+def parse_actionlint(out: str) -> list[Raw]:
+    return [(e.filepath, e.line, f"{e.message} [{e.kind}]") for e in ACTIONLINT.validate_json(out)]
+
+
+def parse_eslint(out: str) -> list[Raw]:
+    return [
+        (f.file_path, m.line, f"{m.rule_id} {m.message}" if m.rule_id else m.message)
+        for f in ESLINT.validate_json(out)
+        for m in f.messages
+    ]
+
+
+def parse_vale(out: str) -> list[Raw]:
+    parsed = VALE.validate_json(out)
+    if isinstance(parsed, ValeError):
+        raise ToolFailureError(f"{parsed.code} {parsed.text}")
+    return [(path, a.line, f"{a.check} {a.message}") for path, alerts in parsed.items() for a in alerts]
+
+
+def parse_tsc(out: str) -> list[Raw]:
+    raws: list[Raw] = []
+    for line in out.splitlines():
+        if not line.strip() or line[0].isspace():
+            continue
+        if match := TSC_LINE.fullmatch(line):
+            if not matches(match["file"], TYPESCRIPT + JAVASCRIPT):
+                raise ToolFailureError(line)
+            raws.append((match["file"], int(match["line"]), f"{match['code']} {match['msg']}"))
+        elif TSC_GLOBAL.fullmatch(line):
+            raise ToolFailureError(line)
+        else:
+            raise ToolFailureError(f"unreadable output: {line}")
+    return raws
+
+
+def matches(path: str, globs: Iterable[str]) -> bool:
+    return any(PurePosixPath(path).full_match(g) for g in globs)
+
+
+def has_shell_shebang(path: Path) -> bool:
+    if path.suffix and not os.access(path, os.X_OK):
+        return False
+    with path.open("rb") as handle:
+        command = parse_shebang(handle)
+    return bool(command) and bool(tags_from_interpreter(command[0]) & SHEBANG_SHELLS)
+
+
+@dataclass(frozen=True)
+class Job:
+    cwd: Path
+    files: list[str]
+
+
+@dataclass(frozen=True)
+class Check:
+    name: str
+    argv: Callable[[Job], list[str]]
+    parse: Callable[[str], list[Raw]]
+    clean: frozenset[int]
+    found: frozenset[int]
+    globs: tuple[str, ...] = ()
+    shebang: bool = False
+    indicator: str | None = None
+    needs_node_modules: bool = False
+    project: bool = False
+
+    def selects(self, path: str, root: Path) -> bool:
+        return matches(path, self.globs) or (self.shebang and has_shell_shebang(root / path))
+
+
+def eslint_argv(job: Job) -> list[str]:
+    return [str(job.cwd / "node_modules/.bin/eslint"), "-f", "json", "--no-warn-ignored", *job.files]
+
+
+def tsc_argv(job: Job) -> list[str]:
+    cache = f"{TSC_CACHE}{job.cwd}/strict.tsbuildinfo"
+    return [
+        *DENO, f"--allow-write={TSC_CACHE}", f"npm:typescript@{TYPESCRIPT_VERSION}/tsc", "-p", ".", "--noEmit",
+        "--pretty", "false", "--composite", "false", "--incremental", "--tsBuildInfoFile", cache, *TSC_FLAGS,
+    ]
+
+
+CHECKS = (
+    Check(
+        "actionlint",
+        lambda j: ["actionlint", "-ignore", 'label ".+" is unknown', "-format", "{{json .}}", *j.files],
+        parse_actionlint, frozenset({0}), frozenset({1}), WORKFLOWS,
+    ),
+    Check(
+        "zizmor",
+        lambda j: [
+            "zizmor", "--quiet", "--offline", "--no-ignores", "--no-progress", "--color", "never",
+            "--strict-collection", "--config", str(EMBEDDED / "zizmor.yml"), "--format", "sarif", *j.files,
+        ],
+        parse_sarif, frozenset({0}), frozenset(), (*WORKFLOWS, "**/action.yml", "**/action.yaml"),
+    ),
+    Check(
+        "typos",
+        lambda j: ["typos", "--force-exclude", "--format", "sarif", *j.files],
+        parse_sarif, frozenset({0}), frozenset({2}), ("**/*",),
+    ),
+    Check(
+        "vale",
+        lambda j: ["vale", "--config", str(EMBEDDED / "vale/.vale.ini"), "--output=JSON", *j.files],
+        parse_vale, frozenset({0}), frozenset({1}), ("**/*.md", "**/*.mdx", "**/*.txt"),
+    ),
+    Check(
+        "eslint", eslint_argv, parse_eslint, frozenset({0}), frozenset({1}), JAVASCRIPT + TYPESCRIPT,
+        indicator="node_modules/.bin/eslint",
+    ),
+    Check(
+        "tsc-strict", tsc_argv, parse_tsc, frozenset({0}), frozenset({1, 2}), TYPESCRIPT,
+        indicator="tsconfig.json", needs_node_modules=True, project=True,
+    ),
+    Check(
+        "eslint-strict",
+        lambda j: [
+            *DENO, f"npm:eslint@{ESLINT_VERSION}", "-c", str(EMBEDDED / "eslint.config.mjs"), "-f", "json",
+            "--no-warn-ignored", *j.files,
+        ],
+        parse_eslint, frozenset({0}), frozenset({1}), TYPESCRIPT, indicator="node_modules",
+    ),
+    Check(
+        "ruff-strict",
+        lambda j: [
+            "ruff", "check", "--no-fix", "--ignore-noqa", "--force-exclude", "--output-format", "sarif",
+            "--extend-select", "ANN,B,BLE,ASYNC,PGH,RUF", "--extend-ignore", "B008,RUF005,RUF010,RUF021,RUF022,RUF023",
+            *j.files,
+        ],
+        parse_sarif, frozenset({0}), frozenset({1}), PYTHON,
+    ),
+    Check(
+        "ty-strict",
+        lambda j: [
+            "ty", "check", "--output-format", "sarif", "--color", "never", "--force-exclude",
+            "-c", "analysis.respect-type-ignore-comments=false", "--ignore", "import-not-found",
+            "--error", "missing-type-argument", "--error", "possibly-unresolved-reference",
+            "--error", "possibly-missing-attribute", "--error", "possibly-missing-import",
+            "--error", "unused-awaitable", "--error", "deprecated", "--error", "redundant-cast", *j.files,
+        ],
+        parse_sarif, frozenset({0}), frozenset({1}), PYTHON, indicator="pyproject.toml",
+    ),
+    Check(
+        "shellcheck-strict",
+        lambda j: [
+            "shellcheck", "-x", "-f", "json1", "-S", "info",
+            "-o", "check-set-e-suppressed,check-extra-masked-returns,check-unassigned-uppercase", *j.files,
+        ],
+        parse_shellcheck, frozenset({0}), frozenset({1}), SHELL, shebang=True,
+    ),
+)
+
+
+@dataclass(order=True, frozen=True)
+class Finding:
+    file: str
+    line: int
+    tool: str
+    message: str
+
+
+@dataclass
+class Report:
+    findings: set[Finding] = field(default_factory=set[Finding])
+    failures: list[str] = field(default_factory=list[str])
+
+    def fail(self, tool: str, reason: str) -> None:
+        self.failures.append(f"tighten: {tool} failed: {reason}")
+
+
+def added_lines(patches: Iterable[pygit2.Patch | None]) -> Added:
+    added: Added = {}
+    for patch in patches:
+        if patch is None or patch.delta.status == DeltaStatus.DELETED or patch.delta.is_binary:
+            continue
+        lines = {line.new_lineno for hunk in patch.hunks for line in hunk.lines if line.origin == "+"}
+        if lines:
+            added.setdefault(patch.delta.new_file.path, set()).update(lines)
+    return added
+
+
+def head_tree(repo: pygit2.Repository) -> pygit2.Tree:
+    if repo.head_is_unborn:
+        return repo[repo.TreeBuilder().write()].peel(pygit2.Tree)
+    return repo.head.peel(pygit2.Tree)
+
+
+def changes(repo: pygit2.Repository, *, staged: bool) -> Added:
+    diff = head_tree(repo).diff_to_index(repo.index, context_lines=0)
+    untracked: list[pygit2.Patch | None] = []
+    if not staged:
+        workdir = repo.index.diff_to_workdir(flags=UNTRACKED, context_lines=0)
+        diff.merge(workdir)
+        untracked = [p for p in workdir if p is not None and p.delta.status == DeltaStatus.UNTRACKED]
+    diff.find_similar()
+    added = added_lines(diff)
+    for path, lines in added_lines(untracked).items():
+        added.setdefault(path, set()).update(lines)
+    return added
+
+
+def excerpt(text: str) -> str:
+    lines = [line for line in text.strip().splitlines() if line.strip()]
+    return " | ".join(lines[-8:])[-800:] or "no output"
+
+
+def kill_tree(proc: subprocess.Popen[str]) -> None:
+    try:
+        children = psutil.Process(proc.pid).children(recursive=True)
+    except psutil.NoSuchProcess:
+        children = []
+    with suppress(ProcessLookupError):
+        os.killpg(proc.pid, signal.SIGKILL)
+    for child in children:
+        with suppress(psutil.NoSuchProcess):
+            child.kill()
+    psutil.wait_procs(children, timeout=5)
+    with suppress(subprocess.TimeoutExpired):
+        proc.communicate(timeout=5)
+
+
+def execute(argv: list[str], cwd: Path) -> tuple[int, str, str]:
+    with subprocess.Popen(
+        argv, cwd=cwd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, errors="replace", process_group=0,
+    ) as proc:
+        try:
+            out, err = proc.communicate(timeout=TIMEOUT)
+        except subprocess.TimeoutExpired:
+            kill_tree(proc)
+            raise ToolFailureError(f"timed out after {TIMEOUT}s, killed with its child processes") from None
+        return proc.returncode, out, err
+
+
+def missing(tool: str) -> str:
+    return f"{tool} is not installed or not on PATH. Report this to the user and do not install it."
+
+
+def run_job(check: Check, job: Job, root: Path, added: Added, report: Report) -> None:
+    argv = check.argv(job)
+    if shutil.which(argv[0]) is None:
+        report.fail(check.name, missing(argv[0]))
+        return
+    try:
+        code, out, err = execute(argv, job.cwd)
+        if code not in check.clean | check.found:
+            raise ToolFailureError(f"exit {code}: {excerpt(err or out)}")
+        try:
+            raws = check.parse(out)
+        except ValidationError:
+            raise ToolFailureError(f"unreadable output: {excerpt(out or err)}") from None
+        if code in check.found and not raws:
+            raise ToolFailureError(f"exit {code} with no findings: {excerpt(err or out)}")
+    except FileNotFoundError:
+        report.fail(check.name, missing(argv[0]))
+        return
+    except ToolFailureError as error:
+        report.fail(check.name, str(error))
+        return
+    for path, line, message in raws:
+        if line is None:
+            report.fail(check.name, message)
+            continue
+        file = repo_path(path, job.cwd, root)
+        if file is not None and line in added.get(file, set()):
+            report.findings.add(Finding(file, line, check.name, message))
+
+
+def repo_path(path: str, cwd: Path, root: Path) -> str | None:
+    resolved = (Path.from_uri(path) if path.startswith("file://") else cwd / path).resolve()
+    if not resolved.is_relative_to(root):
+        return None
+    return resolved.relative_to(root).as_posix()
+
+
+def workspace(path: str, root: Path, indicator: str) -> Path | None:
+    for directory in (root / path).parents:
+        if (directory / indicator).exists():
+            return directory
+        if directory == root:
+            break
+    return None
+
+
+def has_node_modules(directory: Path, root: Path) -> bool:
+    return any((d / "node_modules").is_dir() for d in (directory, *directory.parents) if d.is_relative_to(root))
+
+
+def plan(check: Check, files: list[str], root: Path) -> list[Job]:
+    selected = [f for f in files if check.selects(f, root)]
+    if check.indicator is None:
+        return [Job(root, selected)] if selected else []
+    groups: dict[Path, list[str]] = {}
+    for file in selected:
+        directory = workspace(file, root, check.indicator)
+        if directory is not None and (not check.needs_node_modules or has_node_modules(directory, root)):
+            groups.setdefault(directory, []).append((root / file).relative_to(directory).as_posix())
+    ordered = sorted(groups.items(), key=lambda item: len(item[0].parts), reverse=True)
+    return [Job(d, [] if check.project else fs) for d, fs in ordered]
+
+
+def run_rules(root: Path, added: Added, report: Report) -> None:
+    rules = Rules.model_validate(tomllib.loads((EMBEDDED / "rules.toml").read_text())).rules
+    for path, lines in added.items():
+        posix = PurePosixPath(path)
+        active = [
+            r for r in rules
+            if (not r.include or any(posix.match(g) for g in r.include)) and not any(posix.match(g) for g in r.exclude)
+        ]
+        if not active:
+            continue
+        text = (root / path).read_text(encoding="utf-8", errors="replace").splitlines()
+        for number in lines:
+            for rule in active:
+                if number <= len(text) and re.search(rule.pattern, text[number - 1]):
+                    report.findings.add(Finding(path, number, rule.id, rule.message))
+
+
+def lint(root: Path, added: Added, report: Report) -> None:
+    files = sorted(added)
+    jobs = [(check, job) for check in CHECKS for job in plan(check, files, root)]
+    run_rules(root, added, report)
+    with ThreadPoolExecutor(max_workers=max(len(jobs), 1)) as pool:
+        for future in [pool.submit(run_job, c, j, root, added, report) for c, j in jobs]:
+            future.result()
+
+
+def print_report(report: Report, trailer: str) -> int:
+    current = None
+    for finding in sorted(report.findings):
+        if finding.file != current:
+            current = finding.file
+            print(current, file=sys.stderr)
+        print(f"  {finding.line} [{finding.tool}] {finding.message}", file=sys.stderr)
+    for failure in sorted(report.failures):
+        print(failure, file=sys.stderr)
+    if report.findings:
+        print(f"\n{trailer}", file=sys.stderr)
+    return 2 if report.findings or report.failures else 0
+
+
+def open_repo(cwd: str, flags: RepositoryOpenFlag) -> pygit2.Repository | None:
+    found = pygit2.discover_repository(cwd)
+    if found is None:
+        return None
+    repo = pygit2.Repository(found, flags)
+    return None if repo.workdir is None else repo
+
+
+def existing(root: Path, added: Added) -> Added:
+    return {path: lines for path, lines in added.items() if (root / path).is_file()}
+
+
+def stop() -> int:
+    data = StopInput.model_validate_json(sys.stdin.read())
+    if data.stop_hook_active:
+        return 0
+    marker = Path(os.environ.get("TMPDIR") or "/tmp") / "claude-guards" / data.session_id
+    if not marker.is_file():
+        return 0
+    repo = open_repo(data.cwd, RepositoryOpenFlag.DEFAULT)
+    if repo is None:
+        return 0
+    root = Path(repo.workdir).resolve()
+    since = marker.stat().st_mtime_ns
+    added = {p: lines for p, lines in existing(root, changes(repo, staged=False)).items()
+             if (root / p).stat().st_mtime_ns > since}
+    report = Report()
+    lint(root, added, report)
+    return print_report(report, STOP_TRAILER)
+
+
+def staged() -> int:
+    repo = open_repo(os.getcwd(), RepositoryOpenFlag.FROM_ENV)
+    if repo is None:
+        return 0
+    root = Path(repo.workdir).resolve()
+    report = Report()
+    added = changes(repo, staged=True)
+    status = repo.status()
+    for path in sorted(added):
+        flags = status.get(path, FileStatus.CURRENT)
+        if flags & INDEX_FLAGS and flags & WORKTREE_FLAGS:
+            report.fail("staged", f"{path} is partially staged. Stage the rest or stash it so linters see what is committed")
+            del added[path]
+    lint(root, existing(root, added), report)
+    return print_report(report, STAGED_TRAILER)
+
+
+def manual() -> int:
+    repo = open_repo(os.getcwd(), RepositoryOpenFlag.DEFAULT)
+    if repo is None:
+        print("tighten: not inside a git work tree", file=sys.stderr)
+        return 1
+    root = Path(repo.workdir).resolve()
+    report = Report()
+    lint(root, existing(root, changes(repo, staged=False)), report)
+    return print_report(report, STAGED_TRAILER)
+
+
+def main(args: list[str]) -> int:
+    modes: dict[str, Callable[[], int]] = {"stop": stop, "staged": staged}
+    if not args:
+        return manual()
+    if len(args) == 1 and args[0] in modes:
+        return modes[args[0]]()
+    print(USAGE, file=sys.stderr)
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
