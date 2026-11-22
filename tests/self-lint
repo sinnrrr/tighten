@@ -5,7 +5,7 @@ cd "$here"
 ruff_flags=(check --no-fix --ignore-noqa --force-exclude --output-format concise --extend-select "ANN,B,BLE,ASYNC,PGH,RUF" --extend-ignore "B008,RUF005,RUF010,RUF021,RUF022,RUF023")
 ty_flags=(check --output-format concise --color never --force-exclude -c analysis.respect-type-ignore-comments=false --ignore import-not-found --error missing-type-argument --error possibly-unresolved-reference --error possibly-missing-attribute --error possibly-missing-import --error unused-awaitable --error deprecated --error redundant-cast)
 status=0
-for script in tighten tests/parity tests/verify-design; do
+for script in tighten tests/parity; do
   uv sync --quiet --script "$script"
   python=$(uv python find --script "$script")
   printf '\n$ ruff %s %s\n' "${ruff_flags[*]}" "$script"
@@ -13,8 +13,8 @@ for script in tighten tests/parity tests/verify-design; do
   printf '\n$ ty %s --python %s %s\n' "${ty_flags[*]}" "$python" "$script"
   ty "${ty_flags[@]}" --python "$python" "$script" || status=1
 done
-printf '\n$ shellcheck -x -S info tests/verify-tools tests/self-lint\n'
-shellcheck -x -S info -o check-set-e-suppressed,check-extra-masked-returns,check-unassigned-uppercase tests/verify-tools tests/self-lint || status=1
+printf '\n$ shellcheck -x -S info tests/self-lint\n'
+shellcheck -x -S info -o check-set-e-suppressed,check-extra-masked-returns,check-unassigned-uppercase tests/self-lint || status=1
 copy=$(mktemp -d)
 trap 'rm -rf "$copy"' EXIT
 cp tighten "$copy/tighten"

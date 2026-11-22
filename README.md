@@ -14,9 +14,9 @@ tighten stop     Claude Code Stop hook, reads the hook JSON on stdin
 
 tighten is a single-file [uv](https://docs.astral.sh/uv/) script. Put it on PATH with a symlink or a copy of the whole repo. It finds `embedded/` through its real path, and a symlink on PATH works. The linters come from PATH and tighten installs none of them.
 
-### Claude Code plugin
+### Claude Code Stop hook
 
-`plugin/` is a Claude Code plugin. Its SessionStart hook writes the session marker file `${TMPDIR:-/tmp}/claude-guards/<session_id>`. Its Stop hook runs `tighten stop` with a 180 second timeout. A marketplace entry can point at `./plugin`.
+Run `tighten stop` as a Stop hook with a 180 second timeout. A SessionStart hook has to write the session marker file `${TMPDIR:-/tmp}/claude-guards/<session_id>` first.
 
 In stop mode tighten exits 0 without output when `stop_hook_active` is true, when the marker file is missing or when the hook `cwd` is not inside a git work tree. It checks files that changed against HEAD and untracked files that are not ignored, but only those modified after the marker file. In those files every line changed against HEAD counts, including edits made before the session started.
 
@@ -43,7 +43,7 @@ src/app.ts
 tighten: shellcheck-strict failed: shellcheck is not installed or not on PATH. Report this to the user and do not install it.
 ```
 
-Findings are followed by a closing instruction for the agent. The text is the same as before with the product name changed from `agent-checks` to `tighten`, since the `agent-checks` hook goes away at cutover.
+Findings are followed by a closing instruction for the agent.
 
 ## Exit codes
 
@@ -100,7 +100,7 @@ Tool output is kept only when it points at a line that was added in a file in sc
 
 ## Verified tool behavior
 
-These come from real runs on this machine (`tests/verify-tools` reproduces most of them) with the versions below.
+These come from real runs on this machine with the versions below.
 
 | Tool | Version | Clean | Findings | Failure |
 | ---- | ------- | ----- | -------- | ------- |
@@ -116,23 +116,11 @@ These come from real runs on this machine (`tests/verify-tools` reproduces most 
 
 tsc reports config errors with the same exit code as type errors, so tighten tells them apart by how the lines look. A config error has no file location or points at a non-source file.
 
-## To verify
-
-- **ty, typos and zizmor accept SARIF.** Yes. `ty --output-format sarif`, `typos --format sarif` and `zizmor --format sarif` all print SARIF 2.1.0. typos puts the message in `message.markdown` and leaves `ruleId` null. typos prints one document for several files. ty can print a result with no location (a missing path) and tighten turns that into a failure. zizmor exits 0 with SARIF even with findings, as its docs say.
-- **vale JSON for a normal alert.** An object keyed by the path as given on the command line, each value a list of alerts with `Check`, `Message`, `Line`, `Span`, `Severity`, `Match` and more. A config error is one object with `Code`, `Text`, `Path`, `Line` and `Span`.
-- **actionlint JSON fields.** `message`, `filepath`, `line`, `column`, `end_column`, `kind` and `snippet`. `-ignore` still works with `-format`. A workflow whose only error is the ignored unknown label gives `[]` and exit 0. `-oneline` is dropped because `-format` replaces it.
-- **Staged diff API.** `head_tree.diff_to_index(repo.index)` with rename detection matches `git diff --cached -U0` on the parity fixture. Opening the repo with `RepositoryOpenFlag.FROM_ENV` makes pygit2 read `GIT_INDEX_FILE` (checked with a temporary index made by `GIT_INDEX_FILE=x git add`).
-- **Exit codes.** See the table above.
-- **How vale finds the vendored style.** A relative `StylesPath` is resolved against the directory of the config file, not the working directory. A config at `/tmp/bad.ini` with `StylesPath = nope` reports `/tmp/nope` missing, and the embedded config finds `embedded/vale/styles/ai-tells` when vale runs from `/`. `--config` wins over `VALE_CONFIG_PATH` (a run with `VALE_CONFIG_PATH=/missing.ini` still works). No `vale sync` is needed because the config has no `Packages` line.
-- **ruff and ty on the extensionless script.** Both lint `tighten` when it is passed by name. A copy with a deliberate violation appended gets ANN201 and ANN001 from ruff and `invalid-assignment` from ty. ty runs with `--python` pointing at the script environment from `uv sync --script tighten` and `uv python find --script tighten`, so pygit2, pydantic, psutil and identify resolve. Without that environment ty reports `import-not-found` for them.
-
 ## Tests
 
 ```
-tests/parity          pygit2 against git CLI diffs, prints PASS or FAIL
-tests/verify-design   glob semantics, shebang detection, rules compile and match the semgrep YAML, GIT_INDEX_FILE
-tests/verify-tools    prints tool output and exit codes for the questions above
-tests/self-lint       ruff and ty strict on the scripts, plus a violation copy that both must flag
+tests/parity      pygit2 against git CLI diffs, prints PASS or FAIL
+tests/self-lint   ruff and ty strict on the scripts, plus a violation copy that both must flag
 ```
 
 ## Credits
