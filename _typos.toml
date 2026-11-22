@@ -1,5 +1,5 @@
 [files]
-extend-exclude = ["embedded/vale/styles/"]
+extend-exclude = ["src/tighten/embedded/vale/styles/"]
 
 [default.extend-words]
 xdescribe = "xdescribe"

@@ -6,18 +6,17 @@ It is built for AI coding agents. Agents often get a check to pass by working ar
 
 ## Requirements
 
-- [uv](https://docs.astral.sh/uv/). tighten is a single-file uv script and uv fetches its Python dependencies on first run.
+- [uv](https://docs.astral.sh/uv/). tighten is a Python package that uv installs as a tool, together with its dependencies.
 - git.
 - The linters you want, on PATH. tighten installs none of them. A check whose tool is missing fails the run when it has files to check, so install the ones that match your languages.
 
 ## Install
 
 ```sh
-git clone https://github.com/sinnrrr/tighten
-ln -s "$PWD/tighten/tighten" ~/.local/bin/tighten
+uv tool install git+https://github.com/sinnrrr/tighten
 ```
 
-Keep the clone and symlink the script, because it loads its bundled configs from `embedded/` beside its real path.
+From a local clone, `uv tool install --editable .` picks up edits to the clone without a reinstall.
 
 ## Usage
 
@@ -44,7 +43,7 @@ tighten: shellcheck-strict failed: shellcheck is not installed or not on PATH. R
 
 ## Claude Code
 
-Add a SessionStart hook that writes a marker file and a Stop hook that runs tighten, in `~/.claude/settings.json` or a plugin's `hooks.json`:
+Add a SessionStart hook that writes a marker file, a PostToolUse hook that appends each edited path to it and a Stop hook that runs tighten, in `~/.claude/settings.json` or a plugin's `hooks.json`:
 
 ```json
 {
@@ -59,6 +58,17 @@ Add a SessionStart hook that writes a marker file and a Stop hook that runs tigh
         ]
       }
     ],
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write|MultiEdit|NotebookEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "jq -r '.session_id, (.tool_input.file_path // .tool_input.notebook_path // \"\")' | { read -r id; read -r p; [ -z \"$p\" ] || { d=\"${TMPDIR:-/tmp}/claude-guards\"; mkdir -p \"$d\"; printf '%s\\n' \"$p\" >> \"$d/$id\"; }; }"
+          }
+        ]
+      }
+    ],
     "Stop": [
       {
         "hooks": [{ "type": "command", "command": "tighten stop", "timeout": 180 }]
@@ -68,7 +78,7 @@ Add a SessionStart hook that writes a marker file and a Stop hook that runs tigh
 }
 ```
 
-In stop mode tighten checks only files modified after the session's marker file, so files the agent never touched are skipped. Within those files every line changed against HEAD counts, including uncommitted edits made before the session. It exits 0 with no output when `stop_hook_active` is set, when there is no marker or when the session is not in a git repo. On findings it exits 2 and Claude Code shows the report to the agent, which keeps working.
+In stop mode tighten checks the files listed in the marker, in whatever repo or worktree each one lives, plus files in the session's own repo modified after the marker was created, which covers edits made through shell commands. Files the agent never touched are skipped. Within those files every line changed against HEAD counts, including uncommitted edits made before the session. Paths inside the session folder are shown relative to it, others in full. It exits 0 with no output when `stop_hook_active` is set, when there is no marker or when none of the files is in a git repo. On findings it exits 2 and Claude Code shows the report to the agent, which keeps working.
 
 ## Git pre-commit
 
@@ -88,7 +98,7 @@ Linters read files from the working tree, so a file with unstaged edits on top o
 
 | Check | Files | Runs in |
 | ----- | ----- | ------- |
-| suppression and skipped-test rules | per rule, see `embedded/rules.toml` | in process |
+| suppression and skipped-test rules | per rule, see `src/tighten/embedded/rules.toml` | in process |
 | [actionlint](https://github.com/rhysd/actionlint) | `.github/workflows/*.yml`, `*.yaml` | repo root |
 | [zizmor](https://github.com/zizmorcore/zizmor) | workflows plus `**/action.yml`, `**/action.yaml` | repo root |
 | [typos](https://github.com/crate-ci/typos) | every file | repo root |
@@ -101,15 +111,16 @@ Linters read files from the working tree, so a file with unstaged edits on top o
 | [shellcheck](https://www.shellcheck.net)-strict | `*.sh`, `*.bash` and files with an sh, dash or bash shebang | repo root |
 
 - **Suppression rules** catch new lint and type suppressions across many tools (`eslint-disable`, `@ts-ignore`, `# noqa`, `# type: ignore`, `shellcheck disable`, `nosec` and more), focused or skipped JavaScript tests, unconditional pytest and unittest skips, and disabled JVM and .NET tests.
-- **Strict checks** add rules on top of the repo's own config and ignore inline suppressions. ruff runs with `--ignore-noqa` and extra rule sets, and tsc runs with every strict flag. The full flag lists are in the script.
+- **Strict checks** add rules on top of the repo's own config and ignore inline suppressions. ruff runs with `--ignore-noqa` and extra rule sets, and tsc runs with every strict flag. The full flag lists are in `src/tighten/__init__.py`.
 - **eslint** runs the repo's own eslint and config. tsc-strict and eslint-strict run pinned TypeScript and eslint through [deno](https://deno.com), so deno is needed for those two.
 - **vale** uses the bundled [ai-tells](https://github.com/tbhb/vale-ai-tells) style, which flags common AI writing patterns.
 - Checks with no files in scope are skipped, as are files outside any workspace for the workspace-based checks.
+- Files that `.gitattributes` marks `linguist-vendored` or `linguist-generated` are skipped in every mode.
 
 ## Design notes
 
-- **Hardcoded behavior.** Checks, flags and messages live in the script. Edit the script to change them.
-- **Changed lines come from [pygit2](https://www.pygit2.org).** It gives added line numbers directly, with no diff text to parse. `tests/parity` compares the result with `git diff` on renamed, staged, untracked and force-added files.
+- **Hardcoded behavior.** Checks, flags and messages live in `src/tighten/__init__.py`. Edit it to change them.
+- **Changed lines come from [pygit2](https://www.pygit2.org).** It gives added line numbers directly, with no diff text to parse.
 - **Structured output.** SARIF or JSON where a tool has it, validated with [pydantic](https://docs.pydantic.dev). tsc has no structured output, so it gets a small strict regex parser. Output that does not validate counts as a tool failure.
 - **Failures are loud.** A missing tool, a crash, an unknown exit code or unreadable output fails the run with the tool name and a reason. A broken linter never looks like a pass.
 - **Timeouts clean up.** Each tool runs in its own process group with a 150 second timeout, under Claude Code's 180 second hook limit. On timeout tighten kills the group and every descendant it can find.
@@ -121,7 +132,7 @@ Linters read files from the working tree, so a file with unstaged edits on top o
 | actionlint | 1.7.12 | 0 | 1 | 2 bad flag, 3 unreadable file or bad template |
 | zizmor (SARIF) | 1.32.0 | 0 | 0, findings only in the SARIF | 1 audit error such as bad input or config, 2 bad flag, 3 no inputs collected. Codes 11 to 14 (highest finding informational to high) appear only without SARIF, as the docs say and a plain run returned 14 |
 | typos | 1.52.2 | 0 | 2 | 64 missing path or bad flag |
-| vale | 3.28.1 | 0 | 1 | 2 with JSON `Code` E100 or E201 |
+| vale | 3.28.1 | 0 | 1, or 2 with per-file errors such as bad front matter on stderr, reported as findings | 2 with a JSON error without a file path, such as E100 |
 | eslint | 10.15.0 | 0 (warnings allowed) | 1 | 2 config or internal error |
 | tsc | 5.9.3 | 0 | 2 with `--noEmit` (1 is also accepted, since TypeScript defines it for diagnostics with skipped output) | 2 with a top-level `error TS` line, such as TS18003 |
 | ruff | 0.17.6 | 0 | 1 | 2 |
@@ -131,13 +142,14 @@ Linters read files from the working tree, so a file with unstaged edits on top o
 ## Development
 
 ```
-tests/parity      changed-line detection against git CLI diffs
-tests/self-lint   ruff and ty strict on the scripts, plus a planted violation both must catch
+uv run ruff check && uv run ty check
 ```
+
+Both read their strict settings from `pyproject.toml`.
 
 ## Credits
 
-`embedded/vale/styles/ai-tells` is [tbhb/vale-ai-tells](https://github.com/tbhb/vale-ai-tells) v1.37.0 by Tony Burns, MIT licensed. Its license is in that directory.
+`src/tighten/embedded/vale/styles/ai-tells` is [tbhb/vale-ai-tells](https://github.com/tbhb/vale-ai-tells) by Tony Burns, MIT licensed. Its license is `src/tighten/embedded/vale/LICENSE.ai-tells`. The pinned version is the `Packages` URL in `src/tighten/embedded/vale/.vale.ini`. To bump it, change the version in that URL, run `vale sync --config src/tighten/embedded/vale/.vale.ini` and commit the result.
 
 ## License
 

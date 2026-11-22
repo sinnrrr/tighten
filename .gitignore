@@ -1,2 +1,3 @@
-tests/.cache/
 __pycache__/
+.venv/
+src/tighten/embedded/vale/styles/config/

@@ -1,8 +1,4 @@
-#!/usr/bin/env -S uv run --script
-# /// script
-# requires-python = ">=3.15,<3.16"
-# dependencies = ["identify>=2.6.20", "psutil>=7.2.2", "pydantic>=2.14.4", "pygit2>=1.21.0"]
-# ///
+import json
 import os
 import re
 import shutil
@@ -13,7 +9,8 @@ import tomllib
 from collections.abc import Callable, Iterable
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import suppress
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+from importlib.resources import files
 from pathlib import Path, PurePosixPath
 
 import psutil
@@ -24,7 +21,7 @@ from pydantic.alias_generators import to_camel, to_pascal
 from pygit2.enums import DeltaStatus, DiffOption, FileStatus, RepositoryOpenFlag
 
 TIMEOUT = 150
-EMBEDDED = Path(__file__).resolve().parent / "embedded"
+EMBEDDED = Path(str(files("tighten") / "embedded"))
 HOME = Path.home()
 TSC_CACHE = f"{HOME}/.cache/agent-tsc"
 TYPESCRIPT_VERSION = "5.9.3"
@@ -58,6 +55,7 @@ USAGE = "usage: tighten [stop|staged]"
 
 type Added = dict[str, set[int]]
 type Raw = tuple[str, int | None, str]
+type DocRaw = tuple[str, int, str]
 
 
 class ToolFailureError(Exception):
@@ -146,6 +144,8 @@ class ValeAlert(ValeModel):
 class ValeError(ValeModel):
     code: str
     text: str
+    path: str = ""
+    line: int = 0
 
 
 class Rule(BaseModel):
@@ -172,6 +172,7 @@ SHELLCHECK = TypeAdapter(Shellcheck)
 ACTIONLINT = TypeAdapter(list[ActionlintError])
 ESLINT = TypeAdapter(list[EslintFile])
 VALE = TypeAdapter(ValeError | dict[str, list[ValeAlert]])
+VALE_ERROR = TypeAdapter(ValeError)
 TSC_LINE = re.compile(r"(?P<file>.+?)\((?P<line>\d+),\d+\): (?:error|warning) (?P<code>TS\d+): (?P<msg>.*)")
 TSC_GLOBAL = re.compile(r"(?:error|warning) TS\d+: .*")
 
@@ -210,6 +211,24 @@ def parse_vale(out: str) -> list[Raw]:
     if isinstance(parsed, ValeError):
         raise ToolFailureError(f"{parsed.code} {parsed.text}")
     return [(path, a.line, f"{a.check} {a.message}") for path, alerts in parsed.items() for a in alerts]
+
+
+def parse_vale_errors(err: str) -> list[DocRaw]:
+    decoder = json.JSONDecoder()
+    raws: list[DocRaw] = []
+    text = err.strip()
+    index = 0
+    while index < len(text):
+        try:
+            value, index = decoder.raw_decode(text, index)
+        except json.JSONDecodeError:
+            raise ToolFailureError(f"unreadable output: {excerpt(err)}") from None
+        error = VALE_ERROR.validate_python(value)
+        if not error.path:
+            raise ToolFailureError(f"{error.code} {error.text}")
+        raws.append((error.path, error.line, f"{error.code} {error.text}"))
+        index = len(text) - len(text[index:].lstrip())
+    return raws
 
 
 def parse_tsc(out: str) -> list[Raw]:
@@ -254,6 +273,7 @@ class Check:
     clean: frozenset[int]
     found: frozenset[int]
     globs: tuple[str, ...] = ()
+    parse_stderr: Callable[[str], list[DocRaw]] | None = None
     shebang: bool = False
     indicator: str | None = None
     needs_node_modules: bool = False
@@ -297,7 +317,8 @@ CHECKS = (
     Check(
         "vale",
         lambda j: ["vale", "--config", str(EMBEDDED / "vale/.vale.ini"), "--output=JSON", *j.files],
-        parse_vale, frozenset({0}), frozenset({1}), ("**/*.md", "**/*.mdx", "**/*.txt"),
+        parse_vale, frozenset({0}), frozenset({1, 2}), ("**/*.md", "**/*.mdx", "**/*.txt"),
+        parse_stderr=parse_vale_errors,
     ),
     Check(
         "eslint", eslint_argv, parse_eslint, frozenset({0}), frozenset({1}), JAVASCRIPT + TYPESCRIPT,
@@ -441,10 +462,11 @@ def run_job(check: Check, job: Job, root: Path, added: Added, report: Report) ->
         if code not in check.clean | check.found:
             raise ToolFailureError(f"exit {code}: {excerpt(err or out)}")
         try:
+            docs = check.parse_stderr(err) if check.parse_stderr and err.strip() else []
             raws = check.parse(out)
         except ValidationError:
             raise ToolFailureError(f"unreadable output: {excerpt(out or err)}") from None
-        if code in check.found and not raws:
+        if code in check.found and not raws and not docs:
             raise ToolFailureError(f"exit {code} with no findings: {excerpt(err or out)}")
     except FileNotFoundError:
         report.fail(check.name, missing(argv[0]))
@@ -458,6 +480,12 @@ def run_job(check: Check, job: Job, root: Path, added: Added, report: Report) ->
             continue
         file = repo_path(path, job.cwd, root)
         if file is not None and line in added.get(file, set()):
+            report.findings.add(Finding(file, line, check.name, message))
+    for path, line, message in docs:
+        file = repo_path(path, job.cwd, root)
+        if file is None:
+            report.fail(check.name, f"{path}: {message}")
+        elif file in added:
             report.findings.add(Finding(file, line, check.name, message))
 
 
@@ -497,11 +525,7 @@ def plan(check: Check, files: list[str], root: Path) -> list[Job]:
 def run_rules(root: Path, added: Added, report: Report) -> None:
     rules = Rules.model_validate(tomllib.loads((EMBEDDED / "rules.toml").read_text())).rules
     for path, lines in added.items():
-        posix = PurePosixPath(path)
-        active = [
-            r for r in rules
-            if (not r.include or any(posix.match(g) for g in r.include)) and not any(posix.match(g) for g in r.exclude)
-        ]
+        active = [r for r in rules if (not r.include or matches(path, r.include)) and not matches(path, r.exclude)]
         if not active:
             continue
         text = (root / path).read_text(encoding="utf-8", errors="replace").splitlines()
@@ -542,8 +566,17 @@ def open_repo(cwd: str, flags: RepositoryOpenFlag) -> pygit2.Repository | None:
     return None if repo.workdir is None else repo
 
 
-def existing(root: Path, added: Added) -> Added:
-    return {path: lines for path, lines in added.items() if (root / path).is_file()}
+def skipped(repo: pygit2.Repository, path: str) -> bool:
+    return any(repo.get_attr(path, attr) in (True, "true") for attr in ("linguist-vendored", "linguist-generated"))
+
+
+def existing(repo: pygit2.Repository, added: Added) -> Added:
+    root = Path(repo.workdir)
+    return {path: lines for path, lines in added.items() if (root / path).is_file() and not skipped(repo, path)}
+
+
+def shown(path: Path, cwd: Path) -> str:
+    return path.relative_to(cwd).as_posix() if path.is_relative_to(cwd) else str(path)
 
 
 def stop() -> int:
@@ -553,15 +586,31 @@ def stop() -> int:
     marker = Path(os.environ.get("TMPDIR") or "/tmp") / "claude-guards" / data.session_id
     if not marker.is_file():
         return 0
+    cwd = Path(data.cwd).resolve()
+    info = marker.stat()
+    since = getattr(info, "st_birthtime", info.st_mtime)
+    candidates = {Path(line).resolve() for line in marker.read_text().splitlines() if line.strip()}
     repo = open_repo(data.cwd, RepositoryOpenFlag.DEFAULT)
-    if repo is None:
-        return 0
-    root = Path(repo.workdir).resolve()
-    since = marker.stat().st_mtime_ns
-    added = {p: lines for p, lines in existing(root, changes(repo, staged=False)).items()
-             if (root / p).stat().st_mtime_ns > since}
+    if repo is not None:
+        root = Path(repo.workdir).resolve()
+        paths = (root / p for p in changes(repo, staged=False))
+        candidates |= {p for p in paths if p.is_file() and p.stat().st_mtime > since}
+    groups: dict[str, set[Path]] = {}
+    for path in candidates:
+        found = pygit2.discover_repository(str(path.parent)) if path.is_file() else None
+        if found is not None:
+            groups.setdefault(found, set()).add(path)
     report = Report()
-    lint(root, added, report)
+    for found, paths in groups.items():
+        repo = pygit2.Repository(found)
+        if repo.workdir is None:
+            continue
+        root = Path(repo.workdir).resolve()
+        wanted = {p.relative_to(root).as_posix() for p in paths if p.is_relative_to(root)}
+        part = Report()
+        lint(root, existing(repo, {p: lines for p, lines in changes(repo, staged=False).items() if p in wanted}), part)
+        report.failures += part.failures
+        report.findings |= {replace(f, file=shown(root / f.file, cwd)) for f in part.findings}
     return print_report(report, STOP_TRAILER)
 
 
@@ -578,7 +627,7 @@ def staged() -> int:
         if flags & INDEX_FLAGS and flags & WORKTREE_FLAGS:
             report.fail("staged", f"{path} is partially staged. Stage the rest or stash it so linters see what is committed")
             del added[path]
-    lint(root, existing(root, added), report)
+    lint(root, existing(repo, added), report)
     return print_report(report, STAGED_TRAILER)
 
 
@@ -589,11 +638,12 @@ def manual() -> int:
         return 1
     root = Path(repo.workdir).resolve()
     report = Report()
-    lint(root, existing(root, changes(repo, staged=False)), report)
+    lint(root, existing(repo, changes(repo, staged=False)), report)
     return print_report(report, STAGED_TRAILER)
 
 
-def main(args: list[str]) -> int:
+def main() -> int:
+    args = sys.argv[1:]
     modes: dict[str, Callable[[], int]] = {"stop": stop, "staged": staged}
     if not args:
         return manual()
@@ -601,7 +651,3 @@ def main(args: list[str]) -> int:
         return modes[args[0]]()
     print(USAGE, file=sys.stderr)
     return 1
-
-
-if __name__ == "__main__":
-    sys.exit(main(sys.argv[1:]))
