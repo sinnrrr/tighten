@@ -2,6 +2,8 @@
 
 `tighten` gets your Claude a bit of that IDE feedback: type checkers, linters and spell checkers.
 
+![tighten in a Claude Code session](demo/demo.gif)
+
 ## Setup
 
 Install [uv](https://docs.astral.sh/uv/), then add the Claude Code plugin:
