@@ -1,0 +1,9 @@
+{
+  "name": "tighten",
+  "description": "Strict linters on the lines Claude changed, fed back before it hands over",
+  "author": {
+    "name": "sinnrrr"
+  },
+  "repository": "https://github.com/sinnrrr/tighten",
+  "license": "MIT"
+}

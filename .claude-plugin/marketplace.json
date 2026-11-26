@@ -1,0 +1,14 @@
+{
+  "name": "tighten",
+  "owner": {
+    "name": "sinnrrr"
+  },
+  "description": "tighten as a Claude Code plugin",
+  "plugins": [
+    {
+      "name": "tighten",
+      "source": "./",
+      "description": "Strict linters on the lines Claude changed, fed back before it hands over"
+    }
+  ]
+}
