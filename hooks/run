@@ -1,0 +1,10 @@
+#!/bin/sh
+: "${CLAUDE_PLUGIN_DATA:?}" "${CLAUDE_PLUGIN_ROOT:?}"
+env="$CLAUDE_PLUGIN_DATA/venv"
+export PYTHONPYCACHEPREFIX="$CLAUDE_PLUGIN_DATA/pycache"
+read -r root 2>/dev/null <"$env/.root"
+if [ "$root" != "$CLAUDE_PLUGIN_ROOT" ] || [ "$CLAUDE_PLUGIN_ROOT/uv.lock" -nt "$env/.root" ]; then
+  UV_PROJECT_ENVIRONMENT="$env" uv sync -q --locked --no-dev --project "$CLAUDE_PLUGIN_ROOT" </dev/null >&2 || exit 1
+  echo "$CLAUDE_PLUGIN_ROOT" >"$env/.root"
+fi
+exec "$env/bin/tighten" "$@"

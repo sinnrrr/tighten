@@ -1,34 +1,27 @@
 # tighten
 
-`tighten` gives coding agents the feedback an IDE gives people: type checkers, linters and LSPs. At the end of each Claude Code action it runs those tools on the lines the agent changed and sends the findings back. The agent fixes them before handing over.
-
-## What it runs
-
-- Strict type checkers and linters for Python, TypeScript, shell, GitHub Actions and like markdown stuff.
-- Opinionated rules that improve how the agents write code.
+`tighten` gets your Claude a bit of that IDE feedback: type checkers, linters and spell checkers.
 
 ## Setup
 
-Install the CLI with [uv](https://docs.astral.sh/uv/):
+Install [uv](https://docs.astral.sh/uv/), then add the Claude Code plugin:
 
 ```sh
-uv tool install git+https://github.com/sinnrrr/tighten
+claude plugin marketplace add sinnrrr/tighten
+claude plugin install tighten@tighten
 ```
 
-Then add the Claude Code plugin, which runs `tighten` from your PATH:
+## What it runs
 
-```
-/plugin marketplace add sinnrrr/tighten
-/plugin install tighten@tighten
-```
-
-Each subagent gets the findings for its own edits before it reports back, and the main session gets the rest.
-
-Files in Claude Code's scratchpad folder are skipped. Quoted third-party text such as pasted emails can be skipped with `linguist-vendored` in `.gitattributes`.
-
-## Before each commit
-
-`tighten staged` checks the staged lines. Call it from your git pre-commit hook. Plain `tighten` checks every uncommitted change.
+| Language | Tools |
+|---|---|
+| Python | [ruff](https://docs.astral.sh/ruff/), [ty](https://docs.astral.sh/ty/) |
+| TypeScript | [tsc](https://www.typescriptlang.org/), [ESLint](https://eslint.org/) |
+| JavaScript | [ESLint](https://eslint.org/) |
+| Shell | [ShellCheck](https://www.shellcheck.net/) |
+| GitHub Actions | [actionlint](https://github.com/rhysd/actionlint), [zizmor](https://docs.zizmor.sh/) |
+| Markdown and text | [Vale](https://vale.sh/) with [vale-ai-tells](https://github.com/tbhb/vale-ai-tells) |
+| All files | [typos](https://github.com/crate-ci/typos), built-in rules against suppression comments and skipped tests |
 
 ## License
 
