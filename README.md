@@ -22,7 +22,9 @@ Needs [uv](https://docs.astral.sh/uv/) and git.
 
 ## Claude Code hooks
 
-These need to be added to `~/.claude/settings.json`.
+These need to be added to `~/.claude/settings.json`. Each subagent gets the findings for its own edits before it reports back, and the main session gets the rest.
+
+Files in Claude Code's scratchpad folder are skipped. Quoted third-party text such as pasted emails can be skipped with `linguist-vendored` in `.gitattributes`.
 
 ```json
 {
@@ -37,20 +39,49 @@ These need to be added to `~/.claude/settings.json`.
         ]
       }
     ],
+    "PreToolUse": [
+      {
+        "matcher": "SubagentHandback",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "tighten stop",
+            "timeout": 180
+          }
+        ]
+      }
+    ],
     "PostToolUse": [
       {
         "matcher": "Edit|Write|MultiEdit|NotebookEdit",
         "hooks": [
           {
             "type": "command",
-            "command": "jq -r '.session_id, (.tool_input.file_path // .tool_input.notebook_path // \"\")' | { read -r id; read -r p; [ -z \"$p\" ] || { d=\"${TMPDIR:-/tmp}/claude-guards\"; mkdir -p \"$d\"; printf '%s\\n' \"$p\" >> \"$d/$id\"; }; }"
+            "command": "jq -r '.session_id, (.agent_id // \"\"), (.tool_input.file_path // .tool_input.notebook_path // \"\")' | { read -r id; read -r agent; read -r p; [ -z \"$p\" ] || { d=\"${TMPDIR:-/tmp}/claude-guards\"; mkdir -p \"$d\"; printf '%s\\n' \"$p\" >> \"$d/$id${agent:+.$agent}\"; }; }"
           }
         ]
       }
     ],
     "Stop": [
       {
-        "hooks": [{ "type": "command", "command": "tighten stop", "timeout": 180 }]
+        "hooks": [
+          {
+            "type": "command",
+            "command": "tighten stop",
+            "timeout": 180
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "tighten stop",
+            "timeout": 180
+          }
+        ]
       }
     ]
   }

@@ -5,6 +5,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import time
 import tomllib
 from collections.abc import Callable, Iterable
 from concurrent.futures import ThreadPoolExecutor
@@ -21,6 +22,9 @@ from pydantic.alias_generators import to_camel, to_pascal
 from pygit2.enums import DeltaStatus, DiffOption, FileStatus, RepositoryOpenFlag
 
 TIMEOUT = 150
+BUDGET = 165
+DEADLINE = time.monotonic() + BUDGET
+RUNNING: set[subprocess.Popen[str]] = set()
 EMBEDDED = Path(str(files("tighten") / "embedded"))
 HOME = Path.home()
 TSC_CACHE = f"{HOME}/.cache/agent-tsc"
@@ -52,6 +56,11 @@ STAGED_TRAILER = (
     "If two rules contradict each other, stop and report both rule names to the user."
 )
 USAGE = "usage: tighten [stop|staged]"
+HOOK_EVENTS = frozenset({"Stop", "SubagentStop", "PreToolUse"})
+DATA_FILES = ("**/*.csv", "**/*.tsv", "**/*.json", "**/*.jsonl", "**/*.lock", "**/*.svg", "**/*.ipynb")
+UNTYPED_CELL = re.compile(r"\s*(async\s+)?def _\(")
+CELL_ANNOTATIONS = ("ANN001", "ANN201", "ANN202")
+SCRATCHPAD = re.compile(r"/(private/)?tmp/claude-\d+/[^/]+/[^/]+/scratchpad(/|$)")
 
 type Added = dict[str, set[int]]
 type Raw = tuple[str, int | None, str]
@@ -164,7 +173,9 @@ class Rules(BaseModel):
 class StopInput(BaseModel):
     session_id: str
     cwd: str
+    hook_event_name: str = "Stop"
     stop_hook_active: bool = False
+    agent_id: str | None = None
 
 
 SARIF = TypeAdapter(Sarif)
@@ -254,8 +265,11 @@ def matches(path: str, globs: Iterable[str]) -> bool:
 def has_shell_shebang(path: Path) -> bool:
     if path.suffix and not os.access(path, os.X_OK):
         return False
-    with path.open("rb") as handle:
-        command = parse_shebang(handle)
+    try:
+        with path.open("rb") as handle:
+            command = parse_shebang(handle)
+    except OSError:
+        return False
     return bool(command) and bool(tags_from_interpreter(command[0]) & SHEBANG_SHELLS)
 
 
@@ -273,6 +287,8 @@ class Check:
     clean: frozenset[int]
     found: frozenset[int]
     globs: tuple[str, ...] = ()
+    exclude: tuple[str, ...] = ()
+    drop: Callable[[str, str], bool] | None = None
     parse_stderr: Callable[[str], list[DocRaw]] | None = None
     shebang: bool = False
     indicator: str | None = None
@@ -280,7 +296,13 @@ class Check:
     project: bool = False
 
     def selects(self, path: str, root: Path) -> bool:
+        if matches(path, self.exclude):
+            return False
         return matches(path, self.globs) or (self.shebang and has_shell_shebang(root / path))
+
+
+def untyped_marimo_cell(text: str, message: str) -> bool:
+    return message.startswith(CELL_ANNOTATIONS) and UNTYPED_CELL.match(text) is not None
 
 
 def eslint_argv(job: Job) -> list[str]:
@@ -312,7 +334,7 @@ CHECKS = (
     Check(
         "typos",
         lambda j: ["typos", "--force-exclude", "--format", "sarif", *j.files],
-        parse_sarif, frozenset({0}), frozenset({2}), ("**/*",),
+        parse_sarif, frozenset({0}), frozenset({2}), ("**/*",), DATA_FILES,
     ),
     Check(
         "vale",
@@ -343,7 +365,7 @@ CHECKS = (
             "--extend-select", "ANN,B,BLE,ASYNC,PGH,RUF", "--extend-ignore", "B008,RUF005,RUF010,RUF021,RUF022,RUF023",
             *j.files,
         ],
-        parse_sarif, frozenset({0}), frozenset({1}), PYTHON,
+        parse_sarif, frozenset({0}), frozenset({1}), PYTHON, drop=untyped_marimo_cell,
     ),
     Check(
         "ty-strict",
@@ -436,16 +458,29 @@ def kill_tree(proc: subprocess.Popen[str]) -> None:
 
 
 def execute(argv: list[str], cwd: Path) -> tuple[int, str, str]:
+    timeout = min(TIMEOUT, DEADLINE - time.monotonic())
+    if timeout <= 0:
+        raise ToolFailureError(f"skipped, the {BUDGET}s budget for this run is used up")
     with subprocess.Popen(
         argv, cwd=cwd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         text=True, errors="replace", process_group=0,
     ) as proc:
+        RUNNING.add(proc)
         try:
-            out, err = proc.communicate(timeout=TIMEOUT)
+            out, err = proc.communicate(timeout=timeout)
         except subprocess.TimeoutExpired:
             kill_tree(proc)
-            raise ToolFailureError(f"timed out after {TIMEOUT}s, killed with its child processes") from None
+            raise ToolFailureError(f"timed out after {timeout:.0f}s, killed with its child processes") from None
+        finally:
+            RUNNING.discard(proc)
         return proc.returncode, out, err
+
+
+def terminate(signum: int, _frame: object) -> None:
+    for proc in list(RUNNING):
+        with suppress(ProcessLookupError):
+            os.killpg(proc.pid, signal.SIGKILL)
+    os._exit(128 + signum)
 
 
 def missing(tool: str) -> str:
@@ -474,19 +509,34 @@ def run_job(check: Check, job: Job, root: Path, added: Added, report: Report) ->
     except ToolFailureError as error:
         report.fail(check.name, str(error))
         return
+    texts: dict[str, list[str]] = {}
     for path, line, message in raws:
         if line is None:
             report.fail(check.name, message)
             continue
         file = repo_path(path, job.cwd, root)
-        if file is not None and line in added.get(file, set()):
-            report.findings.add(Finding(file, line, check.name, message))
+        if file is None or line not in added.get(file, set()):
+            continue
+        if check.drop is not None:
+            if file not in texts:
+                texts[file] = read_lines(root / file)
+            text = texts[file][line - 1] if line <= len(texts[file]) else ""
+            if check.drop(text, message):
+                continue
+        report.findings.add(Finding(file, line, check.name, message))
     for path, line, message in docs:
         file = repo_path(path, job.cwd, root)
         if file is None:
             report.fail(check.name, f"{path}: {message}")
         elif file in added:
             report.findings.add(Finding(file, line, check.name, message))
+
+
+def read_lines(path: Path) -> list[str]:
+    try:
+        return path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return []
 
 
 def repo_path(path: str, cwd: Path, root: Path) -> str | None:
@@ -528,7 +578,7 @@ def run_rules(root: Path, added: Added, report: Report) -> None:
         active = [r for r in rules if (not r.include or matches(path, r.include)) and not matches(path, r.exclude)]
         if not active:
             continue
-        text = (root / path).read_text(encoding="utf-8", errors="replace").splitlines()
+        text = read_lines(root / path)
         for number in lines:
             for rule in active:
                 if number <= len(text) and re.search(rule.pattern, text[number - 1]):
@@ -544,18 +594,30 @@ def lint(root: Path, added: Added, report: Report) -> None:
             future.result()
 
 
-def print_report(report: Report, trailer: str) -> int:
+def render(report: Report, trailer: str) -> str:
+    lines: list[str] = []
     current = None
     for finding in sorted(report.findings):
         if finding.file != current:
             current = finding.file
-            print(current, file=sys.stderr)
-        print(f"  {finding.line} [{finding.tool}] {finding.message}", file=sys.stderr)
-    for failure in sorted(report.failures):
-        print(failure, file=sys.stderr)
+            lines.append(current)
+        lines.append(f"  {finding.line} [{finding.tool}] {finding.message}")
+    lines += sorted(set(report.failures))
     if report.findings:
-        print(f"\n{trailer}", file=sys.stderr)
+        lines.append(f"\n{trailer}")
+    return "\n".join(lines)
+
+
+def print_report(report: Report, trailer: str) -> int:
+    if report.findings or report.failures:
+        print(render(report, trailer), file=sys.stderr)
     return 2 if report.findings or report.failures else 0
+
+
+def warn(failures: list[str]) -> int:
+    if failures:
+        print(json.dumps({"systemMessage": "\n".join(sorted(set(failures)))}))
+    return 0
 
 
 def open_repo(cwd: str, flags: RepositoryOpenFlag) -> pygit2.Repository | None:
@@ -579,22 +641,83 @@ def shown(path: Path, cwd: Path) -> str:
     return path.relative_to(cwd).as_posix() if path.is_relative_to(cwd) else str(path)
 
 
-def stop() -> int:
-    data = StopInput.model_validate_json(sys.stdin.read())
-    if data.stop_hook_active:
-        return 0
-    marker = Path(os.environ.get("TMPDIR") or "/tmp") / "claude-guards" / data.session_id
+def guards() -> Path:
+    return Path(os.environ.get("TMPDIR") or "/tmp") / "claude-guards"
+
+
+def marked(marker: Path) -> set[Path]:
     if not marker.is_file():
-        return 0
-    cwd = Path(data.cwd).resolve()
+        return set()
+    return {Path(line).resolve() for line in marker.read_text().splitlines() if line.strip()}
+
+
+def changed_since(directories: Iterable[str], since: float, report: Report) -> set[Path]:
+    seen: set[str] = set()
+    found: set[Path] = set()
+    for directory in directories:
+        repo = open_repo(directory, RepositoryOpenFlag.DEFAULT)
+        if repo is None or repo.workdir in seen:
+            continue
+        seen.add(repo.workdir)
+        root = Path(repo.workdir).resolve()
+        try:
+            paths = [root / p for p in changes(repo, staged=False)]
+        except OSError as error:
+            report.fail("tighten", f"{root}: {error}")
+            continue
+        found |= {p for p in paths if p.is_file() and p.stat().st_mtime > since}
+    return found
+
+
+def session_paths(data: StopInput, report: Report) -> set[Path] | None:
+    directory = guards()
+    if data.agent_id:
+        return marked(directory / f"{data.session_id}.{data.agent_id}")
+    marker = directory / data.session_id
+    if not marker.is_file():
+        return None
     info = marker.stat()
     since = getattr(info, "st_birthtime", info.st_mtime)
-    candidates = {Path(line).resolve() for line in marker.read_text().splitlines() if line.strip()}
-    repo = open_repo(data.cwd, RepositoryOpenFlag.DEFAULT)
-    if repo is not None:
-        root = Path(repo.workdir).resolve()
-        paths = (root / p for p in changes(repo, staged=False))
-        candidates |= {p for p in paths if p.is_file() and p.stat().st_mtime > since}
+    own = marked(marker)
+    delegated: set[Path] = set()
+    for other in directory.glob(f"{data.session_id}.*"):
+        if not other.name.endswith(".last"):
+            delegated |= marked(other)
+    directories = {data.cwd, *(str(p.parent) for p in own if p.parent.is_dir())}
+    return own | (changed_since(directories, since, report) - delegated)
+
+
+def repeated(data: StopInput, text: str) -> bool:
+    if not data.agent_id:
+        return False
+    last = guards() / f"{data.session_id}.{data.agent_id}.last"
+    if last.is_file() and last.read_text() == text:
+        return True
+    last.write_text(text)
+    return False
+
+
+def stop() -> int:
+    data = StopInput.model_validate_json(sys.stdin.read())
+    if data.hook_event_name not in HOOK_EVENTS or (data.stop_hook_active and not data.agent_id):
+        return 0
+    scan = Report()
+    candidates = session_paths(data, scan)
+    if not candidates:
+        return warn(scan.failures)
+    candidates = {p for p in candidates if not SCRATCHPAD.match(p.as_posix())}
+    report = lint_paths(candidates, Path(data.cwd).resolve())
+    report.failures += scan.failures
+    if not report.findings:
+        return warn(report.failures)
+    text = render(report, STOP_TRAILER)
+    if data.stop_hook_active or repeated(data, text):
+        return warn([f"tighten: a subagent finished with findings it was already shown:\n{text}"])
+    print(text, file=sys.stderr)
+    return 2
+
+
+def lint_paths(candidates: set[Path], cwd: Path) -> Report:
     groups: dict[str, set[Path]] = {}
     for path in candidates:
         found = pygit2.discover_repository(str(path.parent)) if path.is_file() else None
@@ -608,10 +731,13 @@ def stop() -> int:
         root = Path(repo.workdir).resolve()
         wanted = {p.relative_to(root).as_posix() for p in paths if p.is_relative_to(root)}
         part = Report()
-        lint(root, existing(repo, {p: lines for p, lines in changes(repo, staged=False).items() if p in wanted}), part)
+        try:
+            lint(root, existing(repo, {p: ls for p, ls in changes(repo, staged=False).items() if p in wanted}), part)
+        except OSError as error:
+            part.fail("tighten", f"{root}: {error}")
         report.failures += part.failures
         report.findings |= {replace(f, file=shown(root / f.file, cwd)) for f in part.findings}
-    return print_report(report, STOP_TRAILER)
+    return report
 
 
 def staged() -> int:
@@ -643,6 +769,8 @@ def manual() -> int:
 
 
 def main() -> int:
+    for signum in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+        signal.signal(signum, terminate)
     args = sys.argv[1:]
     modes: dict[str, Callable[[], int]] = {"stop": stop, "staged": staged}
     if not args:
