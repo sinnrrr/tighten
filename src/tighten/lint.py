@@ -305,6 +305,7 @@ class Check:
     needs_node_modules: bool = False
     project: bool = False
     prune: Callable[[Job], Job] | None = None
+    env: dict[str, str] = field(default_factory=dict[str, str])
 
     def selects(self, path: str, root: Path) -> bool:
         if matches(path, self.exclude):
@@ -362,9 +363,9 @@ CHECKS = (
     ),
     Check(
         "vale",
-        lambda j: ["vale", "--config", str(EMBEDDED / "vale/.vale.ini"), "--output=JSON", *j.files],
+        lambda j: ["vale", "--output=JSON", *j.files],
         parse_vale, frozenset({0}), frozenset({1, 2}), ("**/*.md", "**/*.mdx", "**/*.txt"),
-        parse_stderr=parse_vale_errors,
+        parse_stderr=parse_vale_errors, env={"XDG_CONFIG_HOME": str(EMBEDDED)},
     ),
     Check(
         "eslint", eslint_argv, parse_eslint, frozenset({0}), frozenset({1}), JAVASCRIPT + TYPESCRIPT,
@@ -482,13 +483,13 @@ def kill_tree(proc: subprocess.Popen[str]) -> None:
         proc.communicate(timeout=5)
 
 
-def execute(argv: list[str], cwd: Path) -> tuple[int, str, str]:
+def execute(argv: list[str], cwd: Path, env: dict[str, str] | None = None) -> tuple[int, str, str]:
     timeout = min(TIMEOUT, DEADLINE - time.monotonic())
     if timeout <= 0:
         raise ToolFailureError(f"skipped, the {BUDGET}s budget for this run is used up")
     with subprocess.Popen(
-        argv, cwd=cwd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        text=True, errors="replace", process_group=0,
+        argv, cwd=cwd, env={**os.environ, **env} if env else None, stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, errors="replace", process_group=0,
     ) as proc:
         RUNNING.add(proc)
         try:
@@ -530,7 +531,7 @@ def run_job(check: Check, job: Job, root: Path, added: Added, report: Report) ->
         report.fail(check.name, missing(argv[0]))
         return
     try:
-        code, out, err = execute(argv, job.cwd)
+        code, out, err = execute(argv, job.cwd, check.env)
         if code not in check.clean | check.found:
             raise ToolFailureError(f"exit {code}: {excerpt(err or out)}")
         try:
