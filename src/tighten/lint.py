@@ -181,6 +181,8 @@ SARIF = TypeAdapter(Sarif)
 SHELLCHECK = TypeAdapter(Shellcheck)
 ACTIONLINT = TypeAdapter(list[ActionlintError])
 ESLINT = TypeAdapter(list[EslintFile])
+PATHS = TypeAdapter(list[str])
+OUTSIDE_PROJECT = "was not found by the project service"
 VALE = TypeAdapter(ValeError | dict[str, list[ValeAlert]])
 VALE_ERROR = TypeAdapter(ValeError)
 TSC_LINE = re.compile(r"(?P<file>.+?)\((?P<line>\d+),\d+\): (?:error|warning) (?P<code>TS\d+): (?P<msg>.*)")
@@ -213,6 +215,15 @@ def parse_eslint(out: str) -> list[Raw]:
         (f.file_path, m.line, f"{m.rule_id} {m.message}" if m.rule_id else m.message)
         for f in ESLINT.validate_json(out)
         for m in f.messages
+    ]
+
+
+def parse_eslint_strict(out: str) -> list[Raw]:
+    return [
+        (f.file_path, m.line, f"{m.rule_id} {m.message}" if m.rule_id else m.message)
+        for f in ESLINT.validate_json(out)
+        for m in f.messages
+        if m.rule_id or OUTSIDE_PROJECT not in m.message
     ]
 
 
@@ -293,6 +304,7 @@ class Check:
     indicator: str | None = None
     needs_node_modules: bool = False
     project: bool = False
+    prune: Callable[[Job], Job] | None = None
 
     def selects(self, path: str, root: Path) -> bool:
         if matches(path, self.exclude):
@@ -306,6 +318,19 @@ def untyped_marimo_cell(text: str, message: str) -> bool:
 
 def eslint_argv(job: Job) -> list[str]:
     return [str(job.cwd / "node_modules/.bin/eslint"), "-f", "json", "--no-warn-ignored", *job.files]
+
+
+def eslint_unignored(job: Job) -> Job:
+    if shutil.which("node") is None:
+        raise ToolFailureError(missing("node"))
+    code, out, err = execute(["node", str(EMBEDDED / "eslint-ignored.mjs"), *job.files], job.cwd)
+    if code != 0:
+        raise ToolFailureError(f"could not read the project eslint ignores, exit {code}: {excerpt(err or out)}")
+    try:
+        ignored = set(PATHS.validate_json(out))
+    except ValidationError:
+        raise ToolFailureError(f"unreadable eslint ignore output: {excerpt(out or err)}") from None
+    return replace(job, files=[f for f in job.files if f not in ignored])
 
 
 def tsc_argv(job: Job) -> list[str]:
@@ -355,7 +380,8 @@ CHECKS = (
             *DENO, f"npm:eslint@{ESLINT_VERSION}", "-c", str(EMBEDDED / "eslint.config.mjs"), "-f", "json",
             "--no-warn-ignored", *j.files,
         ],
-        parse_eslint, frozenset({0}), frozenset({1}), TYPESCRIPT, indicator="node_modules",
+        parse_eslint_strict, frozenset({0}), frozenset({1}), TYPESCRIPT, indicator="node_modules",
+        prune=eslint_unignored,
     ),
     Check(
         "ruff-strict",
@@ -491,6 +517,14 @@ def missing(tool: str) -> str:
 
 
 def run_job(check: Check, job: Job, root: Path, added: Added, report: Report) -> None:
+    if check.prune is not None:
+        try:
+            job = check.prune(job)
+        except ToolFailureError as error:
+            report.fail(check.name, str(error))
+            return
+        if not job.files:
+            return
     argv = check.argv(job)
     if shutil.which(argv[0]) is None:
         report.fail(check.name, missing(argv[0]))
